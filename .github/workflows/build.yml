@@ -43,8 +43,8 @@ jobs:
           cat > /usr/local/bin/zig-cc <<'SCRIPT'
           #!/bin/bash
           case "${GOARCH}" in
-            arm64) exec zig cc -target aarch64-linux-gnu "$@" ;;
-            *)     exec zig cc -target x86_64-linux-gnu "$@" ;;
+            arm64) exec zig c++ -target aarch64-linux-gnu "$@" ;;
+            *)     exec zig c++ -target x86_64-linux-gnu "$@" ;;
           esac
           SCRIPT
           chmod +x /usr/local/bin/zig-cc
