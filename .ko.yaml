@@ -1,0 +1,14 @@
+defaultBaseImage: gcr.io/distroless/base-debian12
+defaultPlatforms:
+  - linux/amd64
+  - linux/arm64
+
+builds:
+- id: oauth-server
+  dir: .
+  main: ./cmd/oauth-server
+  env:
+  - CGO_ENABLED=1
+  ldflags:
+  - -s
+  - -w
