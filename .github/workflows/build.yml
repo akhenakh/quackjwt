@@ -37,18 +37,27 @@ jobs:
       - name: Install arm64 cross-compiler
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq g++-aarch64-linux-gnu
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-      - name: Create CC wrapper
+      - name: Create compiler wrappers
         run: |
           cat > /usr/local/bin/cc-wrapper <<'SCRIPT'
+          #!/bin/bash
+          case "${GOARCH}" in
+            arm64) exec aarch64-linux-gnu-gcc "$@" ;;
+            *)     exec gcc "$@" ;;
+          esac
+          SCRIPT
+          chmod +x /usr/local/bin/cc-wrapper
+
+          cat > /usr/local/bin/cxx-wrapper <<'SCRIPT'
           #!/bin/bash
           case "${GOARCH}" in
             arm64) exec aarch64-linux-gnu-g++ "$@" ;;
             *)     exec g++ "$@" ;;
           esac
           SCRIPT
-          chmod +x /usr/local/bin/cc-wrapper
+          chmod +x /usr/local/bin/cxx-wrapper
 
       - uses: docker/login-action@v3
         with:
@@ -60,7 +69,8 @@ jobs:
         env:
           KO_DOCKER_REPO: ghcr.io/akhenakh/quackjwt
           CC: /usr/local/bin/cc-wrapper
-          CXX: /usr/local/bin/cc-wrapper
+          CXX: /usr/local/bin/cxx-wrapper
+          CGO_LDFLAGS: -lstdc++
         run: |
           TAGS="--tags ${{ github.ref_name }}"
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
