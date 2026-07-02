@@ -54,6 +54,8 @@ All environment variables follow the same naming and `_FILE` convention as [csi-
 | `JWT_ISSUER` | — | — | Required `iss` claim |
 | `JWT_USER_CLAIM` | — | `sub` | JWT claim to use as the subject |
 | `QUACK_URI` | — | `quack:0.0.0.0:9494` | Quack listen address |
+| `HTTP_PORT` | — | `0` | Optional landing page port (set to a port number to enable) |
+| `ID_TOKEN_COOKIE` | — | `quackjwt-id-token` | Cookie name for the JWT ID token set by Envoy OAuth2 proxy |
 | `DUCKDB_PATH` | — | `""` | DuckDB database path (empty = in-memory) |
 | `SESSION_TTL` | — | `1h` | Idle session reap interval |
 | `LOG_LEVEL` | — | `INFO` | `DEBUG`, `INFO`, `WARN`, `ERROR` |
@@ -88,6 +90,10 @@ The file is loaded at startup and watched for changes. Whenever it is updated (e
 ### Getting a JWT
 
 Clients obtain JWTs from your identity provider (the same `JWT_JWKS_URL` issuer). The `sub` claim (or `JWT_USER_CLAIM`) maps to an entry in `perm.yaml`. For local testing with a static PEM key, see `keygen` in [csi-secret-age](https://github.com/akhenakh/csi-secret-age) for a Go signer.
+
+### Landing page
+
+Set `HTTP_PORT` to enable a simple landing page that shows the authenticated user and a copy-pasteable DuckDB `ATTACH` command. When running behind Envoy's OAuth2 proxy, the JWT ID token is delivered in the cookie named by `ID_TOKEN_COOKIE` (default `quackjwt-id-token` — this must match `cookieNames.idToken` in your Envoy SecurityPolicy). The handler falls back to the `Authorization: Bearer` header for direct API callers.
 
 ### Kubernetes deployment
 
