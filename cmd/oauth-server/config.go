@@ -52,6 +52,20 @@ type Config struct {
 	JWTJWKSFile string `env:"JWT_JWKS_FILE"`
 	// JWTJWKSRefreshInterval controls how often the JWKS URL cache is refreshed.
 	JWTJWKSRefreshInterval time.Duration `env:"JWT_JWKS_REFRESH_INTERVAL" envDefault:"15m"`
+
+	// S3Region is the AWS region for S3 access. When set, a DuckDB SECRET
+	// (using the ambient credential chain) is auto-created on startup.
+	S3Region string `env:"S3_REGION"`
+	// S3Endpoint sets a custom S3-compatible endpoint (MinIO, R2, …).
+	S3Endpoint string `env:"S3_ENDPOINT"`
+	// S3UseSSL controls whether HTTPS is used for the S3 endpoint.
+	S3UseSSL bool `env:"S3_USE_SSL" envDefault:"true"`
+	// S3Views is a comma-separated list of view-name=file-path pairs. Each
+	// entry creates a DuckDB view IF NOT EXISTS. The reader function is
+	// auto-detected from the file extension (.parquet → read_parquet,
+	// .vortex → read_vortex, etc.).
+	// Example: sales=s3://acme-sales/**/*.parquet,ops_logs=s3://acme-ops-logs/*.parquet
+	S3Views string `env:"S3_VIEWS"`
 }
 
 // resolveSecretValue reads a secret from a file if filePath is set, otherwise

@@ -35,7 +35,7 @@ type Server struct {
 // non-SELECT statement. Matched as function-call / statement-start forms to
 // avoid false positives on string literals.
 const (
-	dangerousFnPattern = `(?i)\b(read_csv|read_csv_auto|read_json|read_json_auto|read_json_objects|read_json_objects_auto|read_parquet|read_parquet_metadata|read_blob|read_blob_auto|read_text|read_text_auto|read_sql|read_ndjson|read_arrow|read_ipc|read_feather|read_avro|read_sqlite|read_postgres|read_mysql|read_duckdb|read_wkb|read_wkt|read_spatial|read_iceberg|st_read|glob|glob_each|list_glob|query_table|query_table_function|duckdb_settings|duckdb_functions|duckdb_secrets|duckdb_persistent_secrets|duckdb_variables|duckdb_memory|duckdb_extensions|duckdb_databases|duckdb_schemas|duckdb_views|duckdb_columns|duckdb_indexes|duckdb_constraints|duckdb_dependencies|duckdb_keywords|duckdb_types|duckdb_partition_info|duckdb_partitions|duckdb_table_info|quack_server_list|quack_identify|quack_clear_cache|quack_query|quack_query_by_name)\s*\(`
+	dangerousFnPattern = `(?i)\b(read_csv|read_csv_auto|read_json|read_json_auto|read_json_objects|read_json_objects_auto|read_parquet|read_parquet_metadata|read_vortex|read_blob|read_blob_auto|read_text|read_text_auto|read_sql|read_ndjson|read_arrow|read_ipc|read_feather|read_avro|read_sqlite|read_postgres|read_mysql|read_duckdb|read_wkb|read_wkt|read_spatial|read_iceberg|st_read|glob|glob_each|list_glob|query_table|query_table_function|duckdb_settings|duckdb_functions|duckdb_secrets|duckdb_persistent_secrets|duckdb_variables|duckdb_memory|duckdb_extensions|duckdb_databases|duckdb_schemas|duckdb_views|duckdb_columns|duckdb_indexes|duckdb_constraints|duckdb_dependencies|duckdb_keywords|duckdb_types|duckdb_partition_info|duckdb_partitions|duckdb_table_info|quack_server_list|quack_identify|quack_clear_cache|quack_query|quack_query_by_name)\s*\(`
 
 	ddlPattern = `(?i)(^|;)\s*(create|insert|update|delete|drop|alter|attach|detach|copy|checkpoint|force_checkpoint|pragma|install|load|set|call|vacuum|summarize)\b`
 
@@ -45,7 +45,7 @@ const (
 	// targets the FROM/JOIN position or a comma-join with a path-like literal
 	// (s3://, https://, /abs, *.parquet, …) so that legitimate WHERE-clause
 	// string filters such as WHERE url = 'https://…' are not affected.
-	pathStringPattern = `(?i)\bfrom\s+\x27[^\x27]*\x27|\bjoin\s+\x27[^\x27]*\x27|,\s*\x27(?:/[^\x27]*|[^\x27]*://[^\x27]*|[^\x27]*\.(?:parquet|csv|json|avro|arrow|feather|ndjson|tsv|orc|txt|sqlite)[^\x27]*)\x27`
+	pathStringPattern = `(?i)\bfrom\s+\x27[^\x27]*\x27|\bjoin\s+\x27[^\x27]*\x27|,\s*\x27(?:/[^\x27]*|[^\x27]*://[^\x27]*|[^\x27]*\.(?:parquet|csv|json|avro|arrow|feather|ndjson|tsv|orc|txt|sqlite|vortex)[^\x27]*)\x27`
 )
 
 const (

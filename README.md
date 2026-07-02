@@ -60,6 +60,10 @@ All environment variables follow the same naming and `_FILE` convention as [csi-
 | `DUCKDB_PATH` | — | `quackjwt.db` | DuckDB database file (or `""` for in-memory) |
 | `SESSION_TTL` | — | `1h` | Idle session reap interval |
 | `LOG_LEVEL` | — | `INFO` | `DEBUG`, `INFO`, `WARN`, `ERROR` |
+| `S3_REGION` | — | — | AWS region; setting this triggers S3 bootstrap |
+| `S3_ENDPOINT` | — | — | Custom S3-compatible endpoint (MinIO, R2, …) |
+| `S3_USE_SSL` | — | `true` | Use HTTPS for S3 endpoint |
+| `S3_VIEWS` | — | — | Comma-separated `name=path` pairs; views are auto-created with the reader matched to the file extension (`.parquet` → `read_parquet`, `.vortex`/`.vx` → `read_vortex`, `.csv` → `read_csv_auto`, etc.) |
 
 Exactly one JWT key source must be set (`JWT_PUBLIC_KEY`, `JWT_JWKS_URL`, or `JWT_JWKS`).
 
@@ -189,7 +193,42 @@ FROM quack_query(
 
 ## S3 / Parquet use case
 
-Deploy the oauth-server on Kubernetes with an IAM role scoped to a fixed set of S3 buckets. Create DuckDB `SECRET`s for S3 access and `VIEW`s over your Parquet data. Map users to views in `perm.yaml`. Clients never see bucket paths, never hold S3 credentials, and cannot call `read_parquet` directly.
+Set `S3_REGION` and `S3_VIEWS` to let the server auto-create the DuckDB secret and views on startup — no manual SQL needed. The reader function is chosen from the file extension automatically:
+
+```bash
+export S3_REGION=us-east-1
+export S3_VIEWS='sales=s3://acme-sales/**/*.parquet,ops_logs=s3://acme-ops-logs/*.parquet,events=s3://acme-events/**/*.vortex'
+```
+
+The server creates `CREATE SECRET IF NOT EXISTS quackjwt_s3` (using the ambient AWS credential chain) and a `CREATE VIEW IF NOT EXISTS` for each entry, using `read_parquet` for `.parquet` files and `read_vortex` for `.vortex`/`.vx` files. Required DuckDB extensions (including `vortex`) are installed and loaded automatically. Views are idempotent across restarts.
+
+On Kubernetes, pair this with an IAM-annotated service account (IRSA) to scope the pod to the exact buckets:
+
+```yaml
+env:
+  - name: S3_REGION
+    value: "us-east-1"
+  - name: S3_VIEWS
+    value: "sales=s3://acme-sales/**/*.parquet,ops_logs=s3://acme-ops-logs/*.parquet,events=s3://acme-events/**/*.vortex"
+  # Non-AWS endpoints:
+  # - name: S3_ENDPOINT
+  #   value: "https://minio.example.com"
+  # - name: S3_USE_SSL
+  #   value: "false"
+```
+
+The view name becomes the grant token in `perm.yaml`:
+
+```yaml
+user_permissions:
+  alice:
+    - sales
+    - ops_logs
+  bob:
+    - sales_redacted
+```
+
+Clients never see bucket paths, never hold S3 credentials, and cannot call `read_parquet` directly.
 
 ```
 ┌──────────┐  JWT (sub=user)   ┌───────────────┐  read_parquet(s3://)  ┌──────────┐
@@ -202,17 +241,7 @@ Deploy the oauth-server on Kubernetes with an IAM role scoped to a fixed set of 
   └─────────────┘
 ```
 
-Example bootstrap SQL run on the server's database before starting:
-
-```sql
-CREATE SECRET acme_s3 (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'us-east-1');
-
-CREATE VIEW sales       AS SELECT * FROM read_parquet('s3://acme-sales/**/*.parquet');
-CREATE VIEW ops_logs    AS SELECT * FROM read_parquet('s3://acme-ops-logs/*.parquet');
-CREATE VIEW hr_salary   AS SELECT * FROM read_parquet('s3://acme-hr-salary/*.parquet');
-```
-
-The defense-in-depth checklist (IAM least privilege, short-lived credentials, TLS fronting, view-level column redaction) is covered in the [Security Considerations](#security-considerations) section below.
+> If you need custom view definitions (e.g. column-level redaction) or additional secrets beyond the credential chain, use `DUCKDB_PATH` with a pre-seeded database file and omit `S3_REGION`.
 
 ## Library usage
 

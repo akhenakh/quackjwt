@@ -212,6 +212,12 @@ func TestQuackJWT_EndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("Arbitrary file read via read_vortex", func(t *testing.T) {
+		if authzAllows(`SELECT * FROM public_metrics, read_vortex('evil.vortex')`) {
+			t.Fatal("read_vortex should be denied even alongside a granted table")
+		}
+	})
+
 	t.Run("System function leakage via duckdb_settings", func(t *testing.T) {
 		if authzAllows(`SELECT * FROM duckdb_settings()`) {
 			t.Fatal("duckdb_settings() should be denied")

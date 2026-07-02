@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -71,6 +72,29 @@ func main() {
 			logger.Error("Failed to set DuckDB extension option", "query", q, "error", err)
 			os.Exit(1)
 		}
+	}
+
+	// S3/bootstrap views: when S3_VIEWS is set, create views with the reader
+	// function auto-detected from each path's file extension. If S3_REGION is
+	// also set, a DuckDB S3 SECRET (credential chain) is created first.
+	if cfg.S3Views != "" {
+		for _, q := range []string{"INSTALL httpfs;", "LOAD httpfs;"} {
+			if _, err := db.Exec(q); err != nil {
+				logger.Error("Failed to load httpfs extension", "error", err)
+				os.Exit(1)
+			}
+		}
+		if cfg.S3Region != "" {
+			if err := createS3Secret(db, cfg); err != nil {
+				logger.Error("Failed to create S3 secret", "error", err)
+				os.Exit(1)
+			}
+		}
+		if err := bootstrapViews(db, cfg); err != nil {
+			logger.Error("Failed to bootstrap views", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("Views bootstrapped", "count", len(strings.Split(cfg.S3Views, ",")))
 	}
 
 	permMgr, err := permissions.New(permissions.Config{
@@ -165,6 +189,116 @@ func main() {
 		logger.Error("Watcher error", "error", err)
 		os.Exit(1)
 	}
+}
+
+// parseS3Views parses a comma-separated list of view-name=s3-path pairs.
+func parseS3Views(raw string) (map[string]string, error) {
+	views := make(map[string]string)
+	if raw == "" {
+		return views, nil
+	}
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		idx := strings.Index(pair, "=")
+		if idx < 0 {
+			return nil, fmt.Errorf("invalid S3_VIEWS entry %q: expected name=s3://path", pair)
+		}
+		name := strings.TrimSpace(pair[:idx])
+		path := strings.TrimSpace(pair[idx+1:])
+		if name == "" || path == "" {
+			return nil, fmt.Errorf("invalid S3_VIEWS entry %q: both name and path are required", pair)
+		}
+		views[name] = path
+	}
+	return views, nil
+}
+
+// createS3Secret creates a DuckDB S3 secret using the ambient credential
+// chain. Idempotent across restarts (IF NOT EXISTS).
+func createS3Secret(db *sql.DB, cfg Config) error {
+	q := fmt.Sprintf(
+		"CREATE SECRET IF NOT EXISTS quackjwt_s3 (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION %s",
+		sqlString(cfg.S3Region),
+	)
+	if cfg.S3Endpoint != "" {
+		q += fmt.Sprintf(", ENDPOINT %s", sqlString(cfg.S3Endpoint))
+	}
+	if !cfg.S3UseSSL {
+		q += ", USE_SSL false"
+	}
+	q += ");"
+	if _, err := db.Exec(q); err != nil {
+		return fmt.Errorf("create S3 secret: %w", err)
+	}
+	return nil
+}
+
+// bootstrapViews parses S3_VIEWS, auto-installs any needed extensions, and
+// creates a VIEW IF NOT EXISTS for each entry. The reader function is chosen
+// from the file extension (e.g. .parquet → read_parquet, .vortex →
+// read_vortex).
+func bootstrapViews(db *sql.DB, cfg Config) error {
+	views, err := parseS3Views(cfg.S3Views)
+	if err != nil {
+		return err
+	}
+
+	needed := map[string]bool{}
+	for _, path := range views {
+		if readerForPath(path) == "read_vortex" {
+			needed["vortex"] = true
+		}
+	}
+	for ext := range needed {
+		for _, q := range []string{
+			fmt.Sprintf("INSTALL %s;", ext),
+			fmt.Sprintf("LOAD %s;", ext),
+		} {
+			if _, err := db.Exec(q); err != nil {
+				return fmt.Errorf("load %s extension: %w", ext, err)
+			}
+		}
+	}
+
+	for name, path := range views {
+		q := fmt.Sprintf(
+			"CREATE VIEW IF NOT EXISTS %s AS SELECT * FROM %s(%s);",
+			sqlIdent(name), readerForPath(path), sqlString(path),
+		)
+		if _, err := db.Exec(q); err != nil {
+			return fmt.Errorf("create view %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// readerForPath returns the DuckDB read function for the given file path,
+// chosen from the file extension.
+func readerForPath(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".vortex", ".vx":
+		return "read_vortex"
+	case ".csv", ".tsv":
+		return "read_csv_auto"
+	case ".json", ".ndjson":
+		return "read_json_auto"
+	default:
+		return "read_parquet"
+	}
+}
+
+// sqlIdent double-quotes an identifier, escaping embedded double quotes.
+func sqlIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// sqlString single-quotes a string literal, escaping embedded single quotes.
+func sqlString(s string) string {
+	return `'` + strings.ReplaceAll(s, `'`, `''`) + `'`
 }
 
 // tableNames returns all base table and view names in the catalog. Admins are
