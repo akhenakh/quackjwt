@@ -34,29 +34,21 @@ jobs:
 
       - uses: ko-build/setup-ko@v0.9
 
-      - uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.13.0
-
-      - name: Create zig cc wrapper
+      - name: Install arm64 cross-compiler
         run: |
-          cat > /usr/local/bin/zig-cc <<'SCRIPT'
-          #!/bin/bash
-          case "${GOARCH}" in
-            arm64) exec zig c++ -target aarch64-linux-gnu "$@" ;;
-            *)     exec zig c++ -target x86_64-linux-gnu "$@" ;;
-          esac
-          SCRIPT
-          chmod +x /usr/local/bin/zig-cc
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++-aarch64-linux-gnu
 
-          cat > /usr/local/bin/zig-cxx <<'SCRIPT'
+      - name: Create CC wrapper
+        run: |
+          cat > /usr/local/bin/cc-wrapper <<'SCRIPT'
           #!/bin/bash
           case "${GOARCH}" in
-            arm64) exec zig c++ -target aarch64-linux-gnu "$@" ;;
-            *)     exec zig c++ -target x86_64-linux-gnu "$@" ;;
+            arm64) exec aarch64-linux-gnu-g++ "$@" ;;
+            *)     exec g++ "$@" ;;
           esac
           SCRIPT
-          chmod +x /usr/local/bin/zig-cxx
+          chmod +x /usr/local/bin/cc-wrapper
 
       - uses: docker/login-action@v3
         with:
@@ -67,8 +59,8 @@ jobs:
       - name: Build and push oauth-server image with ko
         env:
           KO_DOCKER_REPO: ghcr.io/akhenakh/quackjwt
-          CC: /usr/local/bin/zig-cc
-          CXX: /usr/local/bin/zig-cxx
+          CC: /usr/local/bin/cc-wrapper
+          CXX: /usr/local/bin/cc-wrapper
         run: |
           TAGS="--tags ${{ github.ref_name }}"
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
