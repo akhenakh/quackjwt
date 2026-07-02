@@ -28,36 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - uses: ko-build/setup-ko@v0.9
-
-      - name: Install arm64 cross-compiler
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-      - name: Create compiler wrappers
-        run: |
-          cat > /usr/local/bin/cc-wrapper <<'SCRIPT'
-          #!/bin/bash
-          case "${GOARCH}" in
-            arm64) exec aarch64-linux-gnu-gcc "$@" ;;
-            *)     exec gcc "$@" ;;
-          esac
-          SCRIPT
-          chmod +x /usr/local/bin/cc-wrapper
-
-          cat > /usr/local/bin/cxx-wrapper <<'SCRIPT'
-          #!/bin/bash
-          case "${GOARCH}" in
-            arm64) exec aarch64-linux-gnu-g++ "$@" ;;
-            *)     exec g++ "$@" ;;
-          esac
-          SCRIPT
-          chmod +x /usr/local/bin/cxx-wrapper
+      - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
         with:
@@ -65,17 +36,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push oauth-server image with ko
-        env:
-          KO_DOCKER_REPO: ghcr.io/akhenakh/quackjwt
-          CC: /usr/local/bin/cc-wrapper
-          CXX: /usr/local/bin/cxx-wrapper
-          CGO_LDFLAGS: -lstdc++
-        run: |
-          TAGS="--tags ${{ github.ref_name }}"
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            TAGS="$TAGS --tags latest"
-          fi
-          ko build --bare $TAGS \
-            --platform=linux/amd64,linux/arm64 \
-            ./cmd/oauth-server
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/akhenakh/quackjwt
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
