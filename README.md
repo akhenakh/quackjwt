@@ -14,13 +14,6 @@ The `cmd/oauth-server` binary is a batteries-included deployment: give it a JWT 
 go build -o oauth-server ./cmd/oauth-server
 ```
 
-Generate an RSA keypair:
-
-```bash
-openssl genpkey -algorithm RSA -out jwt-private.pem -pkeyopt rsa_keygen_bits:2048
-openssl pkey -in jwt-private.pem -pubout -out jwt-public.pem
-```
-
 Create `perm.yaml`:
 
 ```yaml
@@ -32,15 +25,19 @@ user_permissions:
     - sales_redacted
 ```
 
-Run:
+Point to your IdP's JWKS endpoint (Auth0, Keycloak, Google, …) and run:
 
 ```bash
 export PERM_CONFIG_PATH=/etc/quackjwt/perm.yaml
-export JWT_PUBLIC_KEY_FILE=/etc/quackjwt/secrets/jwt-public.pem
+export JWT_JWKS_URL=https://auth.example.com/.well-known/jwks.json
+export JWT_AUDIENCE=my-client-id
+export JWT_ISSUER=https://auth.example.com
 export QUACK_URI=quack:0.0.0.0:9494
 
 oauth-server
 ```
+
+> For local dev without an IdP, generate an RSA keypair (`openssl genpkey …`) and use `JWT_PUBLIC_KEY_FILE` instead. See the [Configuration](#configuration) table for all options.
 
 ### Configuration
 
@@ -87,33 +84,15 @@ user_permissions:
 
 The file is loaded at startup and watched for changes. Whenever it is updated (either by a direct `write` or by a Kubernetes ConfigMap atomic swap) the server re-parses it and transactionally replaces the grant table — no restart, no disruption.
 
-### Signing a JWT
+### Getting a JWT
 
-Use the `openssl` one-liner below, or a minimal Go signer (see `keygen` in [csi-secret-age](https://github.com/akhenakh/csi-secret-age) for a reusable example):
-
-```bash
-sub=alice
-exp=$(date -d '+24 hours' +%s)
-header=$(printf '{"alg":"RS256","typ":"JWT"}' | base64 -w0 | tr '+/' '-_' | tr -d '=')
-payload=$(printf '{"sub":"%s","exp":%d}' "$sub" "$exp" | base64 -w0 | tr '+/' '-_' | tr -d '=')
-sig=$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign jwt-private.pem -binary | base64 -w0 | tr '+/' '-_' | tr -d '=')
-echo "$header.$payload.$sig"
-```
+Clients obtain JWTs from your identity provider (the same `JWT_JWKS_URL` issuer). The `sub` claim (or `JWT_USER_CLAIM`) maps to an entry in `perm.yaml`. For local testing with a static PEM key, see `keygen` in [csi-secret-age](https://github.com/akhenakh/csi-secret-age) for a Go signer.
 
 ### Kubernetes deployment
 
-Mount the permissions file as a ConfigMap and the JWT key as a Secret:
+Point the server at your IdP's JWKS endpoint. Mount the permissions file as a ConfigMap:
 
 ```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: quackjwt-jwt
-stringData:
-  jwt-public-key.pem: |
-    -----BEGIN PUBLIC KEY-----
-    MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...
----
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -137,24 +116,22 @@ spec:
           env:
             - name: PERM_CONFIG_PATH
               value: /etc/quackjwt/perm.yaml
-            - name: JWT_PUBLIC_KEY_FILE
-              value: /etc/quackjwt/secrets/jwt-public-key.pem
+            - name: JWT_JWKS_URL
+              value: https://auth.example.com/.well-known/jwks.json
+            - name: JWT_AUDIENCE
+              value: my-client-id
+            - name: JWT_ISSUER
+              value: https://auth.example.com
             - name: QUACK_URI
               value: "quack:0.0.0.0:9494"
           volumeMounts:
             - name: perms
               mountPath: /etc/quackjwt/perm.yaml
               subPath: perm.yaml
-            - name: jwt-key
-              mountPath: /etc/quackjwt/secrets
-              readOnly: true
       volumes:
         - name: perms
           configMap:
             name: quackjwt-perms
-        - name: jwt-key
-          secret:
-            secretName: quackjwt-jwt
 ```
 
 When kubelet updates the ConfigMap it atomically swaps the symlink behind `perm.yaml`. The server detects the `Remove` event, re-establishes the watch on the new inode, and reloads. Grant updates are transactional — a concurrent query never observes a half-applied state.
