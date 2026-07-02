@@ -54,7 +54,7 @@ All environment variables follow the same naming and `_FILE` convention as [csi-
 | `JWT_ISSUER` | — | — | Required `iss` claim |
 | `JWT_USER_CLAIM` | — | `sub` | JWT claim to use as the subject |
 | `QUACK_URI` | — | `quack:0.0.0.0:9494` | Quack listen address |
-| `DUCKDB_PATH` | — | `quackjwt.db` | DuckDB database file (or `""` for in-memory) |
+| `DUCKDB_PATH` | — | `""` | DuckDB database path (empty = in-memory) |
 | `SESSION_TTL` | — | `1h` | Idle session reap interval |
 | `LOG_LEVEL` | — | `INFO` | `DEBUG`, `INFO`, `WARN`, `ERROR` |
 | `S3_REGION` | — | — | AWS region; setting this triggers S3 bootstrap |

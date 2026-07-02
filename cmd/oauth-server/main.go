@@ -62,6 +62,10 @@ func main() {
 	}
 	defer db.Close()
 
+	if cfg.DuckDBPath == "" {
+		logger.Warn("DuckDB is in-memory — views, grants, and session state will be lost on restart. Set DUCKDB_PATH to a persistent file for production.")
+	}
+
 	// DuckDB extensions required by quackjwt (httpfs for the control plane,
 	// quack for the remote protocol). autoinstall/autoload make first run
 	// self-sufficient; they are idempotent on subsequent runs.

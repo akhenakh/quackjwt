@@ -19,7 +19,7 @@ import (
 type Config struct {
 	// DuckDBPath is the DuckDB database file (or "" for in-memory). Views and
 	// tables exposed to clients live here.
-	DuckDBPath string `env:"DUCKDB_PATH" envDefault:"quackjwt.db"`
+	DuckDBPath string `env:"DUCKDB_PATH" envDefault:""`
 	// QuackURI is the address Quack binds, e.g. "quack:0.0.0.0:9494".
 	QuackURI string `env:"QUACK_URI" envDefault:"quack:0.0.0.0:9494"`
 	// HTTPPort is the port for the optional landing page. Set to 0 to disable.
