@@ -1,4 +1,4 @@
-defaultBaseImage: gcr.io/distroless/base-debian12
+defaultBaseImage: gcr.io/distroless/cc-debian12
 
 builds:
 - id: oauth-server
