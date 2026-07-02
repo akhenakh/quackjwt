@@ -44,6 +44,10 @@ type Config struct {
 	JWTAudience string `env:"JWT_AUDIENCE"`
 	// JWTIssuer is the expected issuer (iss) claim of incoming JWTs.
 	JWTIssuer string `env:"JWT_ISSUER"`
+	// IDTokenCookie is the name of the cookie that Envoy OAuth2 proxy
+	// stores the ID token (JWT) in. Matches cookieNames.idToken in the
+	// Envoy SecurityPolicy.
+	IDTokenCookie string `env:"ID_TOKEN_COOKIE" envDefault:"quackjwt-id-token"`
 
 	// JWT_JWKS_URL fetches a JSON Web Key Set from an HTTPS (or HTTP) URL.
 	// The key identified by the token's `kid` header is used for RS256

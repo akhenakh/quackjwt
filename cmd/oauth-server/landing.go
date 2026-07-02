@@ -34,7 +34,7 @@ const landingHTML = `<!DOCTYPE html>
 <p>Use this token in DuckDB:</p>
 <pre>INSTALL quack; LOAD quack;
 ATTACH 'quack:{{.Host}}' AS remote (
-    TOKEN '{{.TruncatedToken}}',
+    TOKEN '{{.Token}}',
     DISABLE_SSL false
 );</pre>
 {{else}}
@@ -44,25 +44,31 @@ ATTACH 'quack:{{.Host}}' AS remote (
 </html>`
 
 type landingData struct {
-	User           string
-	TruncatedToken string
-	Host           string
-	Error          string
+	User  string
+	Token string
+	Host  string
+	Error string
 }
 
-func landingHandler(pm *permissions.Manager) http.HandlerFunc {
+func landingHandler(pm *permissions.Manager, cookieName string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		host, _, _ := strings.Cut(r.Host, ":")
 		data := landingData{Host: host}
 
-		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
+		var token string
+		if c, err := r.Cookie(cookieName); err == nil {
+			token = c.Value
+		}
+		if token == "" {
+			if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
+				token = strings.TrimSpace(strings.TrimPrefix(a, "Bearer "))
+			}
+		}
+		if token == "" {
 			_ = landingTmpl.Execute(w, data)
 			return
 		}
 
-		token := strings.TrimPrefix(auth, "Bearer ")
-		token = strings.TrimSpace(token)
 		user, err := pm.VerifyToken(token)
 		if err != nil {
 			data.Error = "Invalid token: " + err.Error()
@@ -72,17 +78,7 @@ func landingHandler(pm *permissions.Manager) http.HandlerFunc {
 		}
 
 		data.User = user
-		data.TruncatedToken = truncateToken(token)
+		data.Token = token
 		_ = landingTmpl.Execute(w, data)
 	}
-}
-
-func truncateToken(t string) string {
-	if b, _, ok := strings.Cut(t, "."); ok {
-		return b + ".…"
-	}
-	if len(t) > 40 {
-		return t[:40] + "…"
-	}
-	return t
 }
