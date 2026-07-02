@@ -181,7 +181,7 @@ func main() {
 	var landingSrv *http.Server
 	if cfg.HTTPPort > 0 {
 		mux := http.NewServeMux()
-		mux.HandleFunc("/", landingHandler(permMgr, cfg.IDTokenCookie))
+		mux.HandleFunc("/", landingHandler(permMgr, cfg.IDTokenCookie, cfg.ExternalDuckPort))
 		landingSrv = &http.Server{Addr: fmt.Sprintf(":%d", cfg.HTTPPort), Handler: mux}
 		g.Go(func() error {
 			logger.Info("Landing page listening", "port", cfg.HTTPPort)

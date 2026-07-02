@@ -56,6 +56,7 @@ All environment variables follow the same naming and `_FILE` convention as [csi-
 | `QUACK_URI` | — | `quack:0.0.0.0:9494` | Quack listen address |
 | `HTTP_PORT` | — | `0` | Optional landing page port (set to a port number to enable) |
 | `ID_TOKEN_COOKIE` | — | `quackjwt-id-token` | Cookie name for the JWT ID token set by Envoy OAuth2 proxy |
+| `EXTERNAL_DUCK_PORT` | — | — | Port shown in the landing page ATTACH command (set when API gateway exposes Quack on a different port, e.g. `443`) |
 | `DUCKDB_PATH` | — | `""` | DuckDB database path (empty = in-memory) |
 | `SESSION_TTL` | — | `1h` | Idle session reap interval |
 | `LOG_LEVEL` | — | `INFO` | `DEBUG`, `INFO`, `WARN`, `ERROR` |
@@ -94,6 +95,8 @@ Clients obtain JWTs from your identity provider (the same `JWT_JWKS_URL` issuer)
 ### Landing page
 
 Set `HTTP_PORT` to enable a simple landing page that shows the authenticated user and a copy-pasteable DuckDB `ATTACH` command. When running behind Envoy's OAuth2 proxy, the JWT ID token is delivered in the cookie named by `ID_TOKEN_COOKIE` (default `quackjwt-id-token` — this must match `cookieNames.idToken` in your Envoy SecurityPolicy). The handler falls back to the `Authorization: Bearer` header for direct API callers.
+
+The ATTACH command uses the request's `Host` header. Set `EXTERNAL_DUCK_PORT` when your API gateway exposes the Quack protocol on a port that differs from the internal listen port (e.g. `443` when terminating TLS at the gateway).
 
 ### Kubernetes deployment
 

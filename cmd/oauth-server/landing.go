@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"html/template"
 	"net/http"
 	"strings"
@@ -33,7 +34,7 @@ const landingHTML = `<!DOCTYPE html>
 <p>Connected as <strong>{{.User}}</strong>.</p>
 <p>Use this token in DuckDB:</p>
 <pre>INSTALL quack; LOAD quack;
-ATTACH 'quack:{{.Host}}' AS remote (
+ATTACH 'quack:{{.Address}}' AS remote (
     TOKEN '{{.Token}}',
     DISABLE_SSL false
 );</pre>
@@ -44,16 +45,20 @@ ATTACH 'quack:{{.Host}}' AS remote (
 </html>`
 
 type landingData struct {
-	User  string
-	Token string
-	Host  string
-	Error string
+	User    string
+	Token   string
+	Address string
+	Error   string
 }
 
-func landingHandler(pm *permissions.Manager, cookieName string) http.HandlerFunc {
+func landingHandler(pm *permissions.Manager, cookieName string, externalPort int) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		host, _, _ := strings.Cut(r.Host, ":")
-		data := landingData{Host: host}
+		address := host
+		if externalPort > 0 {
+			address = fmt.Sprintf("%s:%d", host, externalPort)
+		}
+		data := landingData{Address: address}
 
 		var token string
 		if c, err := r.Cookie(cookieName); err == nil {

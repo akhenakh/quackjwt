@@ -48,6 +48,10 @@ type Config struct {
 	// stores the ID token (JWT) in. Matches cookieNames.idToken in the
 	// Envoy SecurityPolicy.
 	IDTokenCookie string `env:"ID_TOKEN_COOKIE" envDefault:"quackjwt-id-token"`
+	// ExternalDuckPort is the port shown in the landing page ATTACH
+	// command. Set this when your API gateway exposes Quack on a port
+	// that differs from the internal listen port (e.g. 443 behind TLS).
+	ExternalDuckPort int `env:"EXTERNAL_DUCK_PORT"`
 
 	// JWT_JWKS_URL fetches a JSON Web Key Set from an HTTPS (or HTTP) URL.
 	// The key identified by the token's `kid` header is used for RS256
