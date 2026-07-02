@@ -335,8 +335,8 @@ func sqlString(s string) string {
 func tableNames(db *sql.DB) ([]string, error) {
 	rows, err := db.Query(`
 		SELECT table_name
-		FROM duckdb_tables()
-		WHERE schema_name NOT IN ('information_schema', 'pg_catalog')
+		FROM information_schema.tables
+		WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
 		ORDER BY table_name;
 	`)
 	if err != nil {

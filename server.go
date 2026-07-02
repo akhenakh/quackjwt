@@ -175,7 +175,7 @@ func (s *Server) Start() error {
 				)
 				AND NOT EXISTS (
 					SELECT 1
-					FROM duckdb_tables() t
+					FROM information_schema.tables t
 					JOIN quack_sessions s ON s.sid = req_sid
 					WHERE NOT EXISTS (
 						SELECT 1 FROM quack_permissions p
