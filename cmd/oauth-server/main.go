@@ -247,6 +247,9 @@ func createS3Secret(db *sql.DB, cfg Config) error {
 		"CREATE SECRET IF NOT EXISTS quackjwt_s3 (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION %s",
 		sqlString(cfg.S3Region),
 	)
+	if cfg.S3CredentialChain != "" {
+		q += fmt.Sprintf(", CHAIN %s", sqlString(cfg.S3CredentialChain))
+	}
 	if cfg.S3Endpoint != "" {
 		q += fmt.Sprintf(", ENDPOINT %s", sqlString(cfg.S3Endpoint))
 	}

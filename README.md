@@ -58,6 +58,7 @@ All environment variables follow the same naming and `_FILE` convention as [csi-
 | `SESSION_TTL` | — | `1h` | Idle session reap interval |
 | `LOG_LEVEL` | — | `INFO` | `DEBUG`, `INFO`, `WARN`, `ERROR` |
 | `S3_REGION` | — | — | AWS region; setting this triggers S3 bootstrap |
+| `S3_CREDENTIAL_CHAIN` | — | — | AWS SDK credential chain to try (semicolon-separated: `env`, `sts`, `instance`, `config`). For IRSA/EKS, set to `sts` or `env;sts;instance`. See [DuckDB httpfs docs](https://duckdb.org/docs/current/core_extensions/httpfs/s3api#credential_chain-provider). |
 | `S3_ENDPOINT` | — | — | Custom S3-compatible endpoint (MinIO, R2, …) |
 | `S3_USE_SSL` | — | `true` | Use HTTPS for S3 endpoint |
 | `S3_VIEWS` | — | — | Comma-separated `name=path` pairs; views are auto-created with the reader matched to the file extension (`.parquet` → `read_parquet`, `.vortex`/`.vx` → `read_vortex`, `.csv` → `read_csv_auto`, etc.) |
@@ -185,6 +186,8 @@ On Kubernetes, pair this with an IAM-annotated service account (IRSA) to scope t
 env:
   - name: S3_REGION
     value: "us-east-1"
+  - name: S3_CREDENTIAL_CHAIN
+    value: "sts"             # use "env;sts;instance" for a fallback chain
   - name: S3_VIEWS
     value: "sales=s3://acme-sales/**/*.parquet,ops_logs=s3://acme-ops-logs/*.parquet,events=s3://acme-events/**/*.vortex"
   # Non-AWS endpoints:

@@ -60,6 +60,11 @@ type Config struct {
 	S3Region string `env:"S3_REGION"`
 	// S3Endpoint sets a custom S3-compatible endpoint (MinIO, R2, …).
 	S3Endpoint string `env:"S3_ENDPOINT"`
+	// S3CredentialChain is the AWS SDK credential chain to use
+	// (semicolon-separated). Defaults to DuckDB's built-in default chain.
+	// For IRSA/EKS Pod Identity, set to "sts" or "env;sts;instance".
+	// See DuckDB httpfs docs for valid chain names.
+	S3CredentialChain string `env:"S3_CREDENTIAL_CHAIN"`
 	// S3UseSSL controls whether HTTPS is used for the S3 endpoint.
 	S3UseSSL bool `env:"S3_USE_SSL" envDefault:"true"`
 	// S3Views is a comma-separated list of view-name=file-path pairs. Each
