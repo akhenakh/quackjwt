@@ -22,6 +22,8 @@ type Config struct {
 	DuckDBPath string `env:"DUCKDB_PATH" envDefault:"quackjwt.db"`
 	// QuackURI is the address Quack binds, e.g. "quack:0.0.0.0:9494".
 	QuackURI string `env:"QUACK_URI" envDefault:"quack:0.0.0.0:9494"`
+	// HTTPPort is the port for the optional landing page. Set to 0 to disable.
+	HTTPPort int `env:"HTTP_PORT" envDefault:"0"`
 	// SessionTTL controls how long idle sid->sub mappings live before being
 	// reaped.
 	SessionTTL time.Duration `env:"SESSION_TTL" envDefault:"1h"`

@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -171,6 +172,22 @@ func main() {
 		})
 	})
 
+	// Landing page — a tiny HTTP server that validates the Authorization
+	// header and shows connection instructions. Disabled when HTTPPort is 0.
+	var landingSrv *http.Server
+	if cfg.HTTPPort > 0 {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", landingHandler(permMgr))
+		landingSrv = &http.Server{Addr: fmt.Sprintf(":%d", cfg.HTTPPort), Handler: mux}
+		g.Go(func() error {
+			logger.Info("Landing page listening", "port", cfg.HTTPPort)
+			if err := landingSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				return err
+			}
+			return nil
+		})
+	}
+
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
 
@@ -181,6 +198,9 @@ func main() {
 	case <-ctx.Done():
 	}
 
+	if landingSrv != nil {
+		_ = landingSrv.Shutdown(context.Background())
+	}
 	if err := srv.Stop(); err != nil {
 		logger.Error("Error stopping quack server", "error", err)
 	}
