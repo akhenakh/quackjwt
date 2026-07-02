@@ -19,8 +19,8 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - run: go test ./...
       - run: go vet ./...
+      - run: go test ./...
 
   build:
     needs: test
@@ -40,7 +40,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image with ko
+      - name: Build and push oauth-server image with ko
         env:
           KO_DOCKER_REPO: ghcr.io/akhenakh/quackjwt
         run: |
@@ -48,4 +48,4 @@ jobs:
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
             TAGS="$TAGS --tags latest"
           fi
-          ko build --bare $TAGS .
+          ko build --bare $TAGS ./cmd/oauth-server
