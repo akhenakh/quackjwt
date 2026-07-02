@@ -1,7 +1,4 @@
 defaultBaseImage: gcr.io/distroless/base-debian12
-defaultPlatforms:
-  - linux/amd64
-  - linux/arm64
 
 builds:
 - id: oauth-server
