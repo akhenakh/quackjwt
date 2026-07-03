@@ -75,6 +75,10 @@ type Config struct {
 	S3CredentialChain string `env:"S3_CREDENTIAL_CHAIN"`
 	// S3UseSSL controls whether HTTPS is used for the S3 endpoint.
 	S3UseSSL bool `env:"S3_USE_SSL" envDefault:"true"`
+	// S3CredentialRefreshInterval controls how often the DuckDB S3 SECRET is
+	// recreated to pick up fresh credentials from the credential chain. Set
+	// to 0 to disable periodic refresh (credentials are only loaded at startup).
+	S3CredentialRefreshInterval time.Duration `env:"S3_CREDENTIAL_REFRESH_INTERVAL" envDefault:"30m"`
 	// S3Views is a comma-separated list of view-name=file-path pairs. Each
 	// entry creates a DuckDB view IF NOT EXISTS. The reader function is
 	// auto-detected from the file extension (.parquet → read_parquet,

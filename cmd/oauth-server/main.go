@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 	"golang.org/x/sync/errgroup"
@@ -176,6 +177,29 @@ func main() {
 		})
 	})
 
+	// Periodically recreate the DuckDB S3 SECRET so that credential-chain
+	// providers (e.g. IRSA/sts on EKS) resolve fresh temporary credentials.
+	// Without this, DuckDB caches the initial credentials indefinitely and
+	// S3 queries fail with ExpiredToken after the temporary session expires.
+	if cfg.S3Region != "" && cfg.S3CredentialRefreshInterval > 0 && cfg.S3Views != "" {
+		g.Go(func() error {
+			ticker := time.NewTicker(cfg.S3CredentialRefreshInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-ticker.C:
+					if err := refreshS3Secret(db, cfg); err != nil {
+						logger.Error("Failed to refresh S3 secret", "error", err)
+					} else {
+						logger.Debug("S3 secret refreshed")
+					}
+				}
+			}
+		})
+	}
+
 	// Landing page — a tiny HTTP server that validates the Authorization
 	// header and shows connection instructions. Disabled when HTTPPort is 0.
 	var landingSrv *http.Server
@@ -240,13 +264,16 @@ func parseS3Views(raw string) (map[string]string, error) {
 	return views, nil
 }
 
-// createS3Secret creates a DuckDB S3 secret using the ambient credential
-// chain. Idempotent across restarts (IF NOT EXISTS).
-func createS3Secret(db *sql.DB, cfg Config) error {
-	q := fmt.Sprintf(
-		"CREATE SECRET IF NOT EXISTS quackjwt_s3 (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION %s",
-		sqlString(cfg.S3Region),
-	)
+func s3SecretSQL(cfg Config, orReplace bool) string {
+	q := "CREATE "
+	if orReplace {
+		q += "OR REPLACE "
+	}
+	q += "SECRET "
+	if !orReplace {
+		q += "IF NOT EXISTS "
+	}
+	q += fmt.Sprintf("quackjwt_s3 (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION %s", sqlString(cfg.S3Region))
 	if cfg.S3CredentialChain != "" {
 		q += fmt.Sprintf(", CHAIN %s", sqlString(cfg.S3CredentialChain))
 	}
@@ -257,8 +284,26 @@ func createS3Secret(db *sql.DB, cfg Config) error {
 		q += ", USE_SSL false"
 	}
 	q += ");"
+	return q
+}
+
+// createS3Secret creates a DuckDB S3 secret using the ambient credential
+// chain. Idempotent across restarts (IF NOT EXISTS).
+func createS3Secret(db *sql.DB, cfg Config) error {
+	q := s3SecretSQL(cfg, false)
 	if _, err := db.Exec(q); err != nil {
 		return fmt.Errorf("create S3 secret: %w", err)
+	}
+	return nil
+}
+
+// refreshS3Secret atomically replaces the DuckDB S3 secret with fresh
+// credentials from the credential chain. Intended for periodic refresh
+// to handle temporary credential expiry (e.g. IRSA/sts on EKS).
+func refreshS3Secret(db *sql.DB, cfg Config) error {
+	q := s3SecretSQL(cfg, true)
+	if _, err := db.Exec(q); err != nil {
+		return fmt.Errorf("refresh S3 secret: %w", err)
 	}
 	return nil
 }
