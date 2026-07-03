@@ -20,7 +20,11 @@ const landingHTML = `<!DOCTYPE html>
 <style>
   body { font-family: system-ui,sans-serif; max-width:720px; margin:2em auto; padding:0 1em; color:#1a1a1a; }
   code { background:#f0f0f0; padding:.15em .35em; border-radius:4px; font-size:.95em; }
-  pre { background:#1e1e1e; color:#d4d4d4; padding:1em; border-radius:6px; overflow-x:auto; font-size:.9em; }
+  .code-block { position:relative; }
+  .code-block pre { background:#1e1e1e; color:#d4d4d4; padding:1em; padding-right:3em; border-radius:6px; overflow-x:auto; font-size:.9em; }
+  .copy-btn { position:absolute; top:.5em; right:.5em; background:none; border:1px solid #555; border-radius:4px; color:#999; cursor:pointer; padding:3px 6px; font-size:.85em; line-height:1; }
+  .copy-btn:hover { color:#fff; border-color:#999; }
+  .copy-btn.copied { color:#4caf50; border-color:#4caf50; }
   .error { color:#c00; }
   h1 { font-size:1.4em; }
 </style>
@@ -33,14 +37,31 @@ const landingHTML = `<!DOCTYPE html>
 {{if .User}}
 <p>Connected as <strong>{{.User}}</strong>.</p>
 <p>Use this token in DuckDB:</p>
-<pre>INSTALL quack; LOAD quack;
+<div class="code-block">
+<pre id="install-cmd">INSTALL quack; LOAD quack;
 ATTACH 'quack:{{.Address}}' AS remote (
     TOKEN '{{.Token}}',
     DISABLE_SSL false
 );</pre>
+<button class="copy-btn" onclick="copyInstallCmd()" title="Copy to clipboard">&#x2398;</button>
+</div>
 {{else}}
 <p>Include your JWT in the <code>Authorization: Bearer &lt;token&gt;</code> header to authenticate.</p>
 {{end}}
+<script>
+function copyInstallCmd() {
+  const text = document.getElementById('install-cmd').innerText;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.querySelector('.copy-btn');
+    btn.classList.add('copied');
+    btn.innerHTML = '&#10003;';
+    setTimeout(() => {
+      btn.classList.remove('copied');
+      btn.innerHTML = '&#x2398;';
+    }, 2000);
+  });
+}
+</script>
 </body>
 </html>`
 
