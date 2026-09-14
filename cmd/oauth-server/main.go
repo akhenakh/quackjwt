@@ -21,6 +21,7 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2"
 	"golang.org/x/sync/errgroup"
+	"gopkg.in/yaml.v3"
 
 	"github.com/akhenakh/quackjwt"
 	"github.com/akhenakh/quackjwt/permissions"
@@ -80,27 +81,12 @@ func main() {
 		}
 	}
 
-	// S3/bootstrap views: when S3_VIEWS is set, create views with the reader
-	// function auto-detected from each path's file extension. If S3_REGION is
-	// also set, a DuckDB S3 SECRET (credential chain) is created first.
-	if cfg.S3Views != "" {
-		for _, q := range []string{"INSTALL httpfs;", "LOAD httpfs;"} {
-			if _, err := db.Exec(q); err != nil {
-				logger.Error("Failed to load httpfs extension", "error", err)
-				os.Exit(1)
-			}
-		}
-		if cfg.S3Region != "" {
-			if err := createS3Secret(db, cfg); err != nil {
-				logger.Error("Failed to create S3 secret", "error", err)
-				os.Exit(1)
-			}
-		}
-		if err := bootstrapViews(db, cfg); err != nil {
-			logger.Error("Failed to bootstrap views", "error", err)
-			os.Exit(1)
-		}
-		logger.Info("Views bootstrapped", "count", len(strings.Split(cfg.S3Views, ",")))
+	// Validated eagerly, unlike the S3 work below: it is a local file, and a
+	// malformed one is a config error that should stop the process now rather
+	// than after the listener is up.
+	if _, err := loadViewSchemas(cfg.ViewSchemaPath); err != nil {
+		logger.Error("Failed to load view schemas", "path", cfg.ViewSchemaPath, "error", err)
+		os.Exit(1)
 	}
 
 	permMgr, err := permissions.New(permissions.Config{
@@ -166,6 +152,49 @@ func main() {
 	defer cancel()
 
 	g, ctx := errgroup.WithContext(ctx)
+
+	// S3 views are bootstrapped after the listener is up, not before it.
+	// Creating them talks to S3 — listing a glob, reading footers, resolving
+	// credentials — and how long that takes scales with the archive, not with
+	// anything this process controls. Held in front of srv.Start() it delays
+	// the port opening, and a liveness probe kills the container before the
+	// first log line is written, which reads as a crash with no output.
+	//
+	// Consequence: there is a window after startup where the views do not
+	// exist yet and a query naming one fails to bind. That is the honest
+	// failure and it is visible in the logs, unlike the silent restart loop.
+	if cfg.S3Views != "" {
+		g.Go(func() error {
+			for _, q := range []string{"INSTALL httpfs;", "LOAD httpfs;"} {
+				if _, err := db.Exec(q); err != nil {
+					return fmt.Errorf("load httpfs extension: %w", err)
+				}
+			}
+			if cfg.S3Region != "" {
+				if err := createS3Secret(db, cfg); err != nil {
+					logger.Error("Failed to create S3 secret", "error", err)
+					return err
+				}
+			}
+			if err := bootstrapViews(db, cfg); err != nil {
+				// Logged here as well as returned: g.Wait() reports every
+				// group error under one generic message, and this is the one
+				// an operator sees when the archive or its credentials are
+				// wrong.
+				logger.Error("Failed to bootstrap S3 views", "error", err)
+				return err
+			}
+			logger.Info("Views bootstrapped", "count", len(strings.Split(cfg.S3Views, ",")))
+
+			// Admins are granted every table present in the catalog at sync
+			// time, so the initial sync above — which ran before these views
+			// existed — missed them. Re-sync now that they do.
+			if err := syncPermissions(); err != nil {
+				return fmt.Errorf("re-sync permissions after view bootstrap: %w", err)
+			}
+			return nil
+		})
+	}
 
 	// Permissions file watcher: reload on change and re-apply grants
 	// atomically so the DuckDB authz macro never observes a partial state.
@@ -335,11 +364,24 @@ func bootstrapViews(db *sql.DB, cfg Config) error {
 		}
 	}
 
+	schemas, err := loadViewSchemas(cfg.ViewSchemaPath)
+	if err != nil {
+		return err
+	}
+	for name := range schemas {
+		if _, ok := views[name]; !ok {
+			return fmt.Errorf("view schema declared for %q, which is not in S3_VIEWS", name)
+		}
+	}
+
 	for name, path := range views {
 		reader := readerForPath(path)
+		if len(schemas[name]) > 0 && reader != "read_parquet" {
+			return fmt.Errorf("view %q declares a schema but reads with %s, which does not accept one", name, reader)
+		}
 		q := fmt.Sprintf(
 			"CREATE VIEW IF NOT EXISTS %s AS SELECT * FROM %s(%s%s);",
-			sqlIdent(name), reader, sqlString(path), readerOptions(reader),
+			sqlIdent(name), reader, sqlString(path), readerArgs(reader, schemas[name]),
 		)
 		if _, err := db.Exec(q); err != nil {
 			return fmt.Errorf("create view %s: %w", name, err)
@@ -348,24 +390,99 @@ func bootstrapViews(db *sql.DB, cfg Config) error {
 	return nil
 }
 
-// readerOptions returns the named parameters appended to the reader call.
+// viewColumn is one declared column of a view, in the order it should appear.
+type viewColumn struct {
+	Name string `yaml:"name"`
+	Type string `yaml:"type"`
+}
+
+// loadViewSchemas reads the VIEW_SCHEMA_PATH file, mapping view name to its
+// declared columns. An empty path means no view has a declared schema.
 //
-// union_by_name is what lets one view span an archive written by more than one
-// version of a producer: a column added to the writer later is simply NULL on
-// the files that predate it, instead of the whole view binding against
-// whichever file the glob happened to open first and losing every column added
-// since. Without it, "column not found" is reported for a column that most of
-// the archive does have.
+// The file is a list per view rather than a mapping so that column order is
+// the order written, which is the order SELECT * returns:
 //
-// hive_partitioning is stated rather than left to auto-detection, so a path
-// that stops looking hive-shaped does not silently drop the partition columns.
+//	views:
+//	  flights:
+//	    - {name: flight_id, type: VARCHAR}
+//	    - {name: in_tfr,    type: BOOLEAN}
+//	    - {name: tfr_incursions, type: "VARCHAR[]"}
+func loadViewSchemas(path string) (map[string][]viewColumn, error) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read view schema file: %w", err)
+	}
+	var raw struct {
+		Views map[string][]viewColumn `yaml:"views"`
+	}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse view schema file: %w", err)
+	}
+	for name, cols := range raw.Views {
+		if len(cols) == 0 {
+			return nil, fmt.Errorf("view schema %q declares no columns", name)
+		}
+		seen := make(map[string]bool, len(cols))
+		for _, c := range cols {
+			switch {
+			case c.Name == "":
+				return nil, fmt.Errorf("view schema %q has a column with no name", name)
+			case c.Type == "":
+				return nil, fmt.Errorf("view schema %q column %q has no type", name, c.Name)
+			case seen[c.Name]:
+				return nil, fmt.Errorf("view schema %q declares column %q twice", name, c.Name)
+			}
+			seen[c.Name] = true
+		}
+	}
+	return raw.Views, nil
+}
+
+// readerArgs returns the named parameters appended to the reader call, for a
+// view read by reader and optionally declaring cols.
 //
-// read_vortex takes neither, so it gets no options.
-func readerOptions(reader string) string {
+// With no declared schema the view binds from a single file's footer and gets
+// hive_partitioning, stated rather than left to auto-detection so a path that
+// stops looking hive-shaped does not silently drop the partition columns. The
+// cost of this form is that a column the producer added partway through the
+// archive's life is not selectable through the view: whichever file the glob
+// opens first defines the schema. Pass union_by_name on the query that needs
+// to span generations, or declare the columns below.
+//
+// union_by_name is deliberately never set here. It answers that exact problem
+// but makes CREATE VIEW eager — DuckDB reads every footer in the glob to
+// compute the union, which on an archive of any size is one S3 request per
+// object before the process can serve anything.
+//
+// With a declared schema the columns are pinned from the file, so they bind
+// without reading the glob at all and a file predating one of them reads it
+// back as NULL. DuckDB refuses `schema` together with hive partitioning and
+// exposes no partition columns alongside it, so a declared schema trades them
+// away: partition-pruning predicates are no longer expressible against the
+// view. Only worth it for a glob that is not partitioned, or one small enough
+// that a full scan is acceptable.
+//
+// read_vortex takes none of these, and only read_parquet accepts `schema`
+// (verified against DuckDB 1.5.5; read_csv_auto and read_json_auto reject it),
+// which bootstrapViews enforces rather than silently ignoring.
+func readerArgs(reader string, cols []viewColumn) string {
 	if reader == "read_vortex" {
 		return ""
 	}
-	return ", union_by_name = true, hive_partitioning = true"
+	if len(cols) == 0 {
+		return ", hive_partitioning = true"
+	}
+	entries := make([]string, 0, len(cols))
+	for _, c := range cols {
+		entries = append(entries, fmt.Sprintf(
+			"%s: {'name': %s, 'type': %s, 'default_value': NULL}",
+			sqlString(c.Name), sqlString(c.Name), sqlString(c.Type),
+		))
+	}
+	return ", schema = map { " + strings.Join(entries, ", ") + " }"
 }
 
 // readerForPath returns the DuckDB read function for the given file path,

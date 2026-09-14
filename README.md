@@ -65,6 +65,7 @@ All environment variables follow the same naming and `_FILE` convention as [csi-
 | `S3_ENDPOINT` | — | — | Custom S3-compatible endpoint (MinIO, R2, …) |
 | `S3_USE_SSL` | — | `true` | Use HTTPS for S3 endpoint |
 | `S3_VIEWS` | — | — | Comma-separated `name=path` pairs; views are auto-created with the reader matched to the file extension (`.parquet` → `read_parquet`, `.vortex`/`.vx` → `read_vortex`, `.csv` → `read_csv_auto`, etc.) |
+| `VIEW_SCHEMA_PATH` | — | — | YAML file declaring the columns of named views, pinning their schema without reading the whole glob. Trades away the hive partition columns — see below |
 
 Exactly one JWT key source must be set (`JWT_PUBLIC_KEY`, `JWT_JWKS_URL`, or `JWT_JWKS`).
 
@@ -189,7 +190,39 @@ export S3_VIEWS='sales=s3://acme-sales/**/*.parquet,ops_logs=s3://acme-ops-logs/
 
 The server creates `CREATE SECRET IF NOT EXISTS quackjwt_s3` (using the ambient AWS credential chain) and a `CREATE VIEW IF NOT EXISTS` for each entry, using `read_parquet` for `.parquet` files and `read_vortex` for `.vortex`/`.vx` files. Required DuckDB extensions (including `vortex`) are installed and loaded automatically. Views are idempotent across restarts.
 
-Views are created with `union_by_name = true` and `hive_partitioning = true` (except `read_vortex`, which takes neither). `union_by_name` is what lets one view span an archive written by more than one version of a producer: when a column is added to the writer partway through, the files that predate it read the column back as NULL instead of the view binding to whichever file the glob opened first and losing every column added since.
+Views are bootstrapped **after** the Quack listener is up, not before it. Creating them talks to S3, and how long that takes scales with the archive; held in front of the listener it delays the port opening and a liveness probe kills the container before the first log line is written. The cost is a window after startup where a query naming a view fails to bind — visible in the logs, unlike a silent restart loop.
+
+Views are created with `hive_partitioning = true` (except `read_vortex`, which does not take it). `union_by_name` is deliberately **not** set: it would let one view span an archive written by several versions of a producer, but it makes `CREATE VIEW` eager — DuckDB reads every footer in the glob to compute the union, i.e. one S3 request per object at startup. So a view binds from whichever file the glob opens first, and a column the producer added partway through the archive's life is not selectable through it.
+
+Two ways to read across that boundary:
+
+- **Per query** — pass `union_by_name` inline, and the cost is paid by the query that wants it rather than by every startup:
+  ```sql
+  SELECT * FROM remote.query($$
+    SELECT flight_id, in_tfr FROM read_parquet('s3://bucket/flights/**/*.parquet',
+             hive_partitioning = true, union_by_name = true)
+    WHERE year = '2026' AND month = '09'
+  $$);
+  ```
+- **Per view** — declare the columns in `VIEW_SCHEMA_PATH` (below), which pins them without reading the glob.
+
+### `VIEW_SCHEMA_PATH`
+
+A YAML file declaring the columns of one or more views by name. A view listed there is created with `read_parquet`'s `schema` argument: the columns bind from the file rather than from the data, and a file written before one of them existed reads it back as NULL.
+
+```yaml
+views:
+  flights:
+    - {name: flight_id, type: VARCHAR}
+    - {name: in_tfr, type: BOOLEAN}
+    - {name: tfr_incursions, type: "VARCHAR[]"}
+```
+
+Columns are a list, not a mapping, so the declared order is the order `SELECT *` returns them.
+
+**A declared schema trades away the partition columns.** DuckDB refuses `schema` together with hive partitioning and exposes no partition columns alongside it, so `org_id`, `year`, `month`, … are not selectable through such a view and partition-pruning predicates cannot be written against it. Declaring a partition column by hand does not help — it lives in the path, not in the files, and reads back all-NULL. Worth it for a glob that is not partitioned, or one small enough that a full scan is fine; for a large partitioned archive, prefer the inline `union_by_name` form above.
+
+Only `read_parquet` accepts `schema`. A schema declared for a view read by `read_csv_auto`, `read_json_auto` or `read_vortex`, or naming a view absent from `S3_VIEWS`, is refused at startup rather than silently ignored.
 
 On Kubernetes, pair this with an IAM-annotated service account (IRSA) to scope the pod to the exact buckets:
 

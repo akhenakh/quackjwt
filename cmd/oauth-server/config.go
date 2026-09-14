@@ -85,6 +85,15 @@ type Config struct {
 	// .vortex → read_vortex, etc.).
 	// Example: sales=s3://acme-sales/**/*.parquet,ops_logs=s3://acme-ops-logs/*.parquet
 	S3Views string `env:"S3_VIEWS"`
+
+	// ViewSchemaPath is a YAML file declaring the column schema of one or more
+	// views by name. A view listed there is created with read_parquet's
+	// `schema` argument, which pins its columns without reading the whole
+	// glob: files missing a declared column read it back as NULL. Views absent
+	// from the file (or all views, when this is unset) bind to whichever file
+	// the glob opens first, so a column the producer added later is not
+	// selectable through them.
+	ViewSchemaPath string `env:"VIEW_SCHEMA_PATH"`
 }
 
 // resolveSecretValue reads a secret from a file if filePath is set, otherwise
