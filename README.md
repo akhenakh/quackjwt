@@ -220,6 +220,42 @@ views:
 
 Columns are a list, not a mapping, so the declared order is the order `SELECT *` returns them.
 
+#### Generating the file
+
+Derive the columns from the archive rather than typing them. Point `DESCRIBE` at **one recent object** — not the glob, and not an old one, or you will pin the schema you are trying to get away from:
+
+```bash
+FILE=$(aws s3 ls --recursive s3://acme-archive/flights/ \
+       | sort | tail -1 | awk '{print $4}')
+
+{ echo "views:"; echo "  flights:"
+  duckdb -noheader -list -c "
+    SELECT '    - {name: ' || column_name || ', type: \"' || column_type || '\"}'
+    FROM (DESCRIBE SELECT * FROM read_parquet('s3://acme-archive/$FILE'));"
+} > view-schemas.yaml
+```
+
+giving:
+
+```yaml
+views:
+  flights:
+    - {name: flight_id, type: "VARCHAR"}
+    - {name: organization_id, type: "VARCHAR"}
+    - {name: tenant_ids, type: "VARCHAR[]"}
+    - {name: in_tfr, type: "BOOLEAN"}
+    - {name: tfr_incursions, type: "VARCHAR[]"}
+```
+
+Types are quoted because some of them (`VARCHAR[]`, `STRUCT(...)`) are not bare YAML scalars. Mount the file and point `VIEW_SCHEMA_PATH` at it:
+
+```yaml
+- name: VIEW_SCHEMA_PATH
+  value: /etc/quackjwt/view-schemas.yaml
+```
+
+The file is read once at startup, so regenerate and restart when the producer adds a column. Columns it doesn't list are not visible through the view at all — the declaration is the whole schema, not an addition to what the files hold.
+
 **A declared schema trades away the partition columns.** DuckDB refuses `schema` together with hive partitioning and exposes no partition columns alongside it, so `org_id`, `year`, `month`, … are not selectable through such a view and partition-pruning predicates cannot be written against it. Declaring a partition column by hand does not help — it lives in the path, not in the files, and reads back all-NULL. Worth it for a glob that is not partitioned, or one small enough that a full scan is fine; for a large partitioned archive, prefer the inline `union_by_name` form above.
 
 Only `read_parquet` accepts `schema`. A schema declared for a view read by `read_csv_auto`, `read_json_auto` or `read_vortex`, or naming a view absent from `S3_VIEWS`, is refused at startup rather than silently ignored.
@@ -256,8 +292,8 @@ Clients never see bucket paths, never hold S3 credentials, and cannot call `read
 
 ```
 ┌──────────┐  JWT (sub=user)   ┌───────────────┐  read_parquet(s3://)  ┌──────────┐
-│  Client  │ ─────────────────▶│  oauth-server  │ ─────────────────────▶│  S3/IAM  │
-│  DuckDB  │◀─ results (HTTPS)─│  behind TLS    │◀── Parquet chunks ────│  buckets  │
+│  Client  │ ─────────────────▶│  oauth-serve  │ ────────────────────▶ │  S3/IAM  │
+│  DuckDB  │◀─ results (HTTPS)─│  behind TLS   │◀── Parquet chunks ─── │  buckets │
 └──────────┘                   └───────────────┘                       └──────────┘
      │ issued by
   ┌──┴──────────┐
