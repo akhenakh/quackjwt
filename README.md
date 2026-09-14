@@ -189,6 +189,8 @@ export S3_VIEWS='sales=s3://acme-sales/**/*.parquet,ops_logs=s3://acme-ops-logs/
 
 The server creates `CREATE SECRET IF NOT EXISTS quackjwt_s3` (using the ambient AWS credential chain) and a `CREATE VIEW IF NOT EXISTS` for each entry, using `read_parquet` for `.parquet` files and `read_vortex` for `.vortex`/`.vx` files. Required DuckDB extensions (including `vortex`) are installed and loaded automatically. Views are idempotent across restarts.
 
+Views are created with `union_by_name = true` and `hive_partitioning = true` (except `read_vortex`, which takes neither). `union_by_name` is what lets one view span an archive written by more than one version of a producer: when a column is added to the writer partway through, the files that predate it read the column back as NULL instead of the view binding to whichever file the glob opened first and losing every column added since.
+
 On Kubernetes, pair this with an IAM-annotated service account (IRSA) to scope the pod to the exact buckets:
 
 ```yaml

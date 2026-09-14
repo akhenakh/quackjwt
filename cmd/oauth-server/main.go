@@ -336,15 +336,36 @@ func bootstrapViews(db *sql.DB, cfg Config) error {
 	}
 
 	for name, path := range views {
+		reader := readerForPath(path)
 		q := fmt.Sprintf(
-			"CREATE VIEW IF NOT EXISTS %s AS SELECT * FROM %s(%s);",
-			sqlIdent(name), readerForPath(path), sqlString(path),
+			"CREATE VIEW IF NOT EXISTS %s AS SELECT * FROM %s(%s%s);",
+			sqlIdent(name), reader, sqlString(path), readerOptions(reader),
 		)
 		if _, err := db.Exec(q); err != nil {
 			return fmt.Errorf("create view %s: %w", name, err)
 		}
 	}
 	return nil
+}
+
+// readerOptions returns the named parameters appended to the reader call.
+//
+// union_by_name is what lets one view span an archive written by more than one
+// version of a producer: a column added to the writer later is simply NULL on
+// the files that predate it, instead of the whole view binding against
+// whichever file the glob happened to open first and losing every column added
+// since. Without it, "column not found" is reported for a column that most of
+// the archive does have.
+//
+// hive_partitioning is stated rather than left to auto-detection, so a path
+// that stops looking hive-shaped does not silently drop the partition columns.
+//
+// read_vortex takes neither, so it gets no options.
+func readerOptions(reader string) string {
+	if reader == "read_vortex" {
+		return ""
+	}
+	return ", union_by_name = true, hive_partitioning = true"
 }
 
 // readerForPath returns the DuckDB read function for the given file path,
