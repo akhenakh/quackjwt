@@ -11,36 +11,61 @@ import (
 	_ "github.com/duckdb/duckdb-go/v2"
 )
 
-func TestReaderArgs(t *testing.T) {
-	for reader, want := range map[string]string{
-		"read_parquet":   ", hive_partitioning = true",
-		"read_csv_auto":  ", hive_partitioning = true",
-		"read_json_auto": ", hive_partitioning = true",
-		"read_vortex":    "",
-	} {
-		if got := readerArgs(reader, nil); got != want {
-			t.Errorf("readerArgs(%q, nil) = %q, want %q", reader, got, want)
+func TestViewQuery(t *testing.T) {
+	const path = "s3://b/**/*.parquet"
+	cols := []viewColumn{{Name: "in_tfr", Type: "BOOLEAN"}}
+
+	t.Run("no schema gets hive partitioning", func(t *testing.T) {
+		got := viewQuery("read_parquet", path, viewSchema{})
+		if !strings.Contains(got, "hive_partitioning = true") {
+			t.Errorf("viewQuery = %q, want hive_partitioning", got)
 		}
-	}
+	})
 
-	// A declared schema replaces hive_partitioning rather than joining it:
-	// DuckDB refuses the two together.
-	got := readerArgs("read_parquet", []viewColumn{{Name: "in_tfr", Type: "BOOLEAN"}})
-	if strings.Contains(got, "hive_partitioning") {
-		t.Errorf("readerArgs with a declared schema still sets hive_partitioning: %q", got)
-	}
-	if !strings.Contains(got, "'in_tfr'") || !strings.Contains(got, "'BOOLEAN'") {
-		t.Errorf("readerArgs = %q, want the declared column and type", got)
-	}
+	t.Run("read_vortex takes no options", func(t *testing.T) {
+		got := viewQuery("read_vortex", path, viewSchema{})
+		if strings.Contains(got, "hive_partitioning") || strings.Contains(got, "schema") {
+			t.Errorf("viewQuery = %q, want a bare call", got)
+		}
+	})
 
-	// union_by_name must never be the default: it makes CREATE VIEW read every
-	// footer in the glob, which is one S3 request per object at startup.
-	for _, args := range []string{
-		readerArgs("read_parquet", nil),
-		readerArgs("read_parquet", []viewColumn{{Name: "a", Type: "VARCHAR"}}),
+	// DuckDB refuses a declared schema together with hive partitioning.
+	t.Run("declared schema replaces hive partitioning", func(t *testing.T) {
+		got := viewQuery("read_parquet", path, viewSchema{Columns: cols})
+		if strings.Contains(got, "hive_partitioning") {
+			t.Errorf("viewQuery = %q, still sets hive_partitioning", got)
+		}
+		if !strings.Contains(got, "'in_tfr'") {
+			t.Errorf("viewQuery = %q, want the declared column", got)
+		}
+	})
+
+	t.Run("partitions are derived and filename dropped", func(t *testing.T) {
+		got := viewQuery("read_parquet", path, viewSchema{
+			Columns:    cols,
+			Partitions: []partitionColumn{{Name: "org_id"}, {Name: "year", Type: "BIGINT"}},
+		})
+		for _, want := range []string{
+			"filename = true",
+			"EXCLUDE (filename)",
+			`regexp_extract(filename, 'org_id=([^/]+)', 1) AS "org_id"`,
+			`CAST(regexp_extract(filename, 'year=([^/]+)', 1) AS BIGINT) AS "year"`,
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("viewQuery = %q, want it to contain %q", got, want)
+			}
+		}
+	})
+
+	// union_by_name must never appear: it makes CREATE VIEW read every footer
+	// in the glob, i.e. one S3 request per object at startup.
+	for _, v := range []viewSchema{
+		{},
+		{Columns: cols},
+		{Columns: cols, Partitions: []partitionColumn{{Name: "org_id"}}},
 	} {
-		if strings.Contains(args, "union_by_name") {
-			t.Errorf("readerArgs sets union_by_name: %q", args)
+		if q := viewQuery("read_parquet", path, v); strings.Contains(q, "union_by_name") {
+			t.Errorf("viewQuery sets union_by_name: %q", q)
 		}
 	}
 }
@@ -161,10 +186,70 @@ func TestBootstrapViewsDeclaredSchema(t *testing.T) {
 		t.Errorf("row written after the column existed: in_tfr = %v, want true", v)
 	}
 
-	// The trade-off: a declared schema exposes no hive partition columns, so
-	// pruning predicates cannot be written against this view.
+	// A declared schema on its own exposes no partition columns: DuckDB will
+	// not combine `schema` with hive partitioning. Declaring partitions is
+	// what brings them back — see TestBootstrapViewsDerivedPartitions.
 	if _, err := db.Query(`SELECT month FROM flights`); err == nil {
-		t.Error("expected partition columns to be absent from a view with a declared schema")
+		t.Error("expected partition columns to be absent without declared partitions")
+	}
+}
+
+// TestBootstrapViewsDerivedPartitions covers the form that has both: columns
+// pinned from the schema file, and partition columns rebuilt out of each
+// object's path, so a view can expose a late-added column without giving up
+// the predicates that prune.
+func TestBootstrapViewsDerivedPartitions(t *testing.T) {
+	db := openDuckDB(t)
+	glob := twoGenerationArchive(t, db)
+
+	schemaFile := filepath.Join(t.TempDir(), "schemas.yaml")
+	if err := os.WriteFile(schemaFile, []byte(`views:
+  flights:
+    columns:
+      - {name: flight_id, type: VARCHAR}
+      - {name: in_tfr, type: BOOLEAN}
+    partitions:
+      - {name: year, type: BIGINT}
+      - {name: month}
+`), 0o644); err != nil {
+		t.Fatalf("write schema file: %v", err)
+	}
+
+	cfg := Config{S3Views: fmt.Sprintf("flights=%s", glob), ViewSchemaPath: schemaFile}
+	if err := bootstrapViews(db, cfg); err != nil {
+		t.Fatalf("bootstrapViews: %v", err)
+	}
+
+	// The late-added column and the partition columns, in one query.
+	var month string
+	var inTFR *bool
+	err := db.QueryRow(`SELECT month, in_tfr FROM flights WHERE year = 2026 AND month = '09'`).
+		Scan(&month, &inTFR)
+	if err != nil {
+		t.Fatalf("select declared column beside derived partitions: %v", err)
+	}
+	if month != "09" {
+		t.Errorf("month = %q, want %q", month, "09")
+	}
+	if inTFR == nil || !*inTFR {
+		t.Errorf("in_tfr = %v, want true", inTFR)
+	}
+
+	// The row from before the column existed still reads NULL, and its
+	// partition still resolves.
+	var oldMonth string
+	var oldTFR *bool
+	if err := db.QueryRow(`SELECT month, in_tfr FROM flights WHERE flight_id = 'a'`).
+		Scan(&oldMonth, &oldTFR); err != nil {
+		t.Fatalf("select pre-column row: %v", err)
+	}
+	if oldMonth != "08" || oldTFR != nil {
+		t.Errorf("pre-column row: month = %q, in_tfr = %v; want \"08\", NULL", oldMonth, oldTFR)
+	}
+
+	// filename is plumbing for the partition values, not a column of the view.
+	if _, err := db.Query(`SELECT filename FROM flights`); err == nil {
+		t.Error("filename should not be exposed by the view")
 	}
 }
 
@@ -210,23 +295,44 @@ func TestLoadViewSchemas(t *testing.T) {
 		}
 	})
 
-	t.Run("column order is file order", func(t *testing.T) {
+	// The bare-list spelling is the original form and must keep working.
+	t.Run("bare list is columns, in file order", func(t *testing.T) {
 		f := write(t, "views:\n  flights:\n    - {name: z, type: VARCHAR}\n    - {name: a, type: BOOLEAN}\n")
 		got, err := loadViewSchemas(f)
 		if err != nil {
 			t.Fatalf("loadViewSchemas: %v", err)
 		}
-		if len(got["flights"]) != 2 || got["flights"][0].Name != "z" || got["flights"][1].Name != "a" {
-			t.Errorf("columns = %+v, want declared order z, a", got["flights"])
+		cols := got["flights"].Columns
+		if len(cols) != 2 || cols[0].Name != "z" || cols[1].Name != "a" {
+			t.Errorf("columns = %+v, want declared order z, a", cols)
+		}
+		if len(got["flights"].Partitions) != 0 {
+			t.Errorf("partitions = %+v, want none", got["flights"].Partitions)
+		}
+	})
+
+	t.Run("mapping form carries partitions", func(t *testing.T) {
+		f := write(t, "views:\n  flights:\n    columns:\n      - {name: a, type: VARCHAR}\n    partitions:\n      - {name: org_id}\n      - {name: year, type: BIGINT}\n")
+		got, err := loadViewSchemas(f)
+		if err != nil {
+			t.Fatalf("loadViewSchemas: %v", err)
+		}
+		parts := got["flights"].Partitions
+		if len(parts) != 2 || parts[0].Name != "org_id" || parts[1].Type != "BIGINT" {
+			t.Errorf("partitions = %+v, want org_id and year BIGINT", parts)
 		}
 	})
 
 	for name, body := range map[string]string{
-		"no columns":     "views:\n  flights: []\n",
-		"missing name":   "views:\n  flights:\n    - {type: VARCHAR}\n",
-		"missing type":   "views:\n  flights:\n    - {name: a}\n",
-		"duplicate name": "views:\n  flights:\n    - {name: a, type: VARCHAR}\n    - {name: a, type: BOOLEAN}\n",
-		"not yaml":       "\tthis: [is: not\n",
+		"no columns":                    "views:\n  flights: []\n",
+		"missing name":                  "views:\n  flights:\n    - {type: VARCHAR}\n",
+		"missing type":                  "views:\n  flights:\n    - {name: a}\n",
+		"duplicate name":                "views:\n  flights:\n    - {name: a, type: VARCHAR}\n    - {name: a, type: BOOLEAN}\n",
+		"not yaml":                      "\tthis: [is: not\n",
+		"partitions without columns":    "views:\n  flights:\n    partitions:\n      - {name: org_id}\n",
+		"partition with no name":        "views:\n  flights:\n    columns:\n      - {name: a, type: VARCHAR}\n    partitions:\n      - {type: VARCHAR}\n",
+		"partition clashes with column": "views:\n  flights:\n    columns:\n      - {name: a, type: VARCHAR}\n    partitions:\n      - {name: a}\n",
+		"partition name not a path key": "views:\n  flights:\n    columns:\n      - {name: a, type: VARCHAR}\n    partitions:\n      - {name: \"or/g\"}\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := loadViewSchemas(write(t, body)); err == nil {

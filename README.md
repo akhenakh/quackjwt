@@ -65,7 +65,7 @@ All environment variables follow the same naming and `_FILE` convention as [csi-
 | `S3_ENDPOINT` | — | — | Custom S3-compatible endpoint (MinIO, R2, …) |
 | `S3_USE_SSL` | — | `true` | Use HTTPS for S3 endpoint |
 | `S3_VIEWS` | — | — | Comma-separated `name=path` pairs; views are auto-created with the reader matched to the file extension (`.parquet` → `read_parquet`, `.vortex`/`.vx` → `read_vortex`, `.csv` → `read_csv_auto`, etc.) |
-| `VIEW_SCHEMA_PATH` | — | — | YAML file declaring the columns of named views, pinning their schema without reading the whole glob. Trades away the hive partition columns — see below |
+| `VIEW_SCHEMA_PATH` | — | — | YAML file declaring the columns of named views, pinning their schema without reading the whole glob, plus the partition columns to rebuild from each object's path — see below |
 
 Exactly one JWT key source must be set (`JWT_PUBLIC_KEY`, `JWT_JWKS_URL`, or `JWT_JWKS`).
 
@@ -228,10 +228,11 @@ Derive the columns from the archive rather than typing them. Point `DESCRIBE` at
 FILE=$(aws s3 ls --recursive s3://acme-archive/flights/ \
        | sort | tail -1 | awk '{print $4}')
 
-{ echo "views:"; echo "  flights:"
+{ echo "views:"; echo "  flights:"; echo "    columns:"
   duckdb -noheader -list -c "
-    SELECT '    - {name: ' || column_name || ', type: \"' || column_type || '\"}'
-    FROM (DESCRIBE SELECT * FROM read_parquet('s3://acme-archive/$FILE'));"
+    SELECT '      - {name: ' || column_name || ', type: \"' || column_type || '\"}'
+    FROM (DESCRIBE SELECT * FROM read_parquet('s3://acme-archive/$FILE',
+                                              hive_partitioning = false));"
 } > view-schemas.yaml
 ```
 
@@ -240,12 +241,15 @@ giving:
 ```yaml
 views:
   flights:
-    - {name: flight_id, type: "VARCHAR"}
-    - {name: organization_id, type: "VARCHAR"}
-    - {name: tenant_ids, type: "VARCHAR[]"}
-    - {name: in_tfr, type: "BOOLEAN"}
-    - {name: tfr_incursions, type: "VARCHAR[]"}
+    columns:
+      - {name: flight_id, type: "VARCHAR"}
+      - {name: organization_id, type: "VARCHAR"}
+      - {name: tenant_ids, type: "VARCHAR[]"}
+      - {name: in_tfr, type: "BOOLEAN"}
+      - {name: tfr_incursions, type: "VARCHAR[]"}
 ```
+
+then add the `partitions:` block by hand — those come from the path, so `DESCRIBE` cannot generate them.
 
 Types are quoted because some of them (`VARCHAR[]`, `STRUCT(...)`) are not bare YAML scalars. Mount the file and point `VIEW_SCHEMA_PATH` at it:
 
@@ -256,7 +260,37 @@ Types are quoted because some of them (`VARCHAR[]`, `STRUCT(...)`) are not bare 
 
 The file is read once at startup, so regenerate and restart when the producer adds a column. Columns it doesn't list are not visible through the view at all — the declaration is the whole schema, not an addition to what the files hold.
 
-**A declared schema trades away the partition columns.** DuckDB refuses `schema` together with hive partitioning and exposes no partition columns alongside it, so `org_id`, `year`, `month`, … are not selectable through such a view and partition-pruning predicates cannot be written against it. Declaring a partition column by hand does not help — it lives in the path, not in the files, and reads back all-NULL. Worth it for a glob that is not partitioned, or one small enough that a full scan is fine; for a large partitioned archive, prefer the inline `union_by_name` form above.
+Generate with `hive_partitioning = false`, as above. Without it `DESCRIBE` appends the partition columns, and listing those under `columns:` bakes in four permanently-NULL columns — they belong under `partitions:`.
+
+**A declared schema on its own trades away the partition columns.** DuckDB refuses `schema` together with hive partitioning and exposes no partition columns alongside it, so `org_id`, `year`, `month`, … are not selectable and no predicate can prune on them. Listing a partition column under `columns:` does not help — it lives in the path, not in the files, and reads back all-NULL.
+
+Declare it under `partitions:` instead, which rebuilds it from each object's path:
+
+```yaml
+views:
+  flights:
+    columns:
+      - {name: flight_id, type: VARCHAR}
+      - {name: in_tfr, type: BOOLEAN}
+    partitions:
+      - {name: org_id}
+      - {name: year, type: BIGINT}
+      - {name: month}
+      - {name: day, type: BIGINT}
+```
+
+Each becomes `regexp_extract(filename, '<name>=([^/]+)', 1)` over the object's path, so the view has both the pinned columns and the partition columns, and `WHERE org_id = … AND year = 2026` works again. `type` is optional and defaults to VARCHAR, which is what a path segment is; give one to cast (a VARCHAR `month` still compares fine against `'09'` or `9`, but **not** against `'9'`).
+
+**This does not cost pruning.** DuckDB pushes the predicate down through the `regexp_extract` onto the filename it is about to read, so partitions declared this way skip the same files hive partitioning would. Measured on identical queries:
+
+| predicate | hive partitioning | declared partitions |
+| --- | --- | --- |
+| `month = '09'` | 7 of 8 files read | 7 of 8 |
+| `org_id = '…'` | 4 files read | 4 |
+
+The `filename` column that carries the values is plumbing and is dropped from the view.
+
+The bare-list spelling (`flights:` followed directly by the column list) still means columns only, and is equivalent to a `columns:` key with no `partitions:`.
 
 Only `read_parquet` accepts `schema`. A schema declared for a view read by `read_csv_auto`, `read_json_auto` or `read_vortex`, or naming a view absent from `S3_VIEWS`, is refused at startup rather than silently ignored.
 

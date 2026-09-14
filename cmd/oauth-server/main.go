@@ -376,12 +376,11 @@ func bootstrapViews(db *sql.DB, cfg Config) error {
 
 	for name, path := range views {
 		reader := readerForPath(path)
-		if len(schemas[name]) > 0 && reader != "read_parquet" {
+		if len(schemas[name].Columns) > 0 && reader != "read_parquet" {
 			return fmt.Errorf("view %q declares a schema but reads with %s, which does not accept one", name, reader)
 		}
-		q := fmt.Sprintf(
-			"CREATE VIEW IF NOT EXISTS %s AS SELECT * FROM %s(%s%s);",
-			sqlIdent(name), reader, sqlString(path), readerArgs(reader, schemas[name]),
+		q := fmt.Sprintf("CREATE VIEW IF NOT EXISTS %s AS %s;",
+			sqlIdent(name), viewQuery(reader, path, schemas[name]),
 		)
 		if _, err := db.Exec(q); err != nil {
 			return fmt.Errorf("create view %s: %w", name, err)
@@ -396,18 +395,55 @@ type viewColumn struct {
 	Type string `yaml:"type"`
 }
 
-// loadViewSchemas reads the VIEW_SCHEMA_PATH file, mapping view name to its
-// declared columns. An empty path means no view has a declared schema.
+// partitionColumn is a column recovered from the object's path rather than
+// read from inside it, e.g. org_id out of ".../org_id=<uuid>/...". Type is
+// optional and defaults to VARCHAR, which is what a path segment is.
+type partitionColumn struct {
+	Name string `yaml:"name"`
+	Type string `yaml:"type"`
+}
+
+// viewSchema is one view's declaration: the columns pinned from this file
+// rather than from the data, and the partition columns to rebuild from each
+// object's path.
+type viewSchema struct {
+	Columns    []viewColumn      `yaml:"columns"`
+	Partitions []partitionColumn `yaml:"partitions"`
+}
+
+// UnmarshalYAML accepts both spellings of a view entry. A bare list is the
+// original form and means columns only:
 //
-// The file is a list per view rather than a mapping so that column order is
-// the order written, which is the order SELECT * returns:
+//	flights:
+//	  - {name: flight_id, type: VARCHAR}
 //
-//	views:
-//	  flights:
+// A mapping adds partitions:
+//
+//	flights:
+//	  columns:
 //	    - {name: flight_id, type: VARCHAR}
-//	    - {name: in_tfr,    type: BOOLEAN}
-//	    - {name: tfr_incursions, type: "VARCHAR[]"}
-func loadViewSchemas(path string) (map[string][]viewColumn, error) {
+//	  partitions:
+//	    - {name: org_id}
+func (v *viewSchema) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.SequenceNode {
+		return node.Decode(&v.Columns)
+	}
+	// Alias to avoid recursing back into this method.
+	type plain viewSchema
+	var p plain
+	if err := node.Decode(&p); err != nil {
+		return err
+	}
+	*v = viewSchema(p)
+	return nil
+}
+
+// loadViewSchemas reads the VIEW_SCHEMA_PATH file, mapping view name to its
+// declaration. An empty path means no view has one.
+//
+// Columns are a list rather than a mapping so that their order is the order
+// written, which is the order SELECT * returns.
+func loadViewSchemas(path string) (map[string]viewSchema, error) {
 	if path == "" {
 		return nil, nil
 	}
@@ -416,17 +452,17 @@ func loadViewSchemas(path string) (map[string][]viewColumn, error) {
 		return nil, fmt.Errorf("read view schema file: %w", err)
 	}
 	var raw struct {
-		Views map[string][]viewColumn `yaml:"views"`
+		Views map[string]viewSchema `yaml:"views"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse view schema file: %w", err)
 	}
-	for name, cols := range raw.Views {
-		if len(cols) == 0 {
+	for name, v := range raw.Views {
+		if len(v.Columns) == 0 {
 			return nil, fmt.Errorf("view schema %q declares no columns", name)
 		}
-		seen := make(map[string]bool, len(cols))
-		for _, c := range cols {
+		seen := make(map[string]bool, len(v.Columns)+len(v.Partitions))
+		for _, c := range v.Columns {
 			switch {
 			case c.Name == "":
 				return nil, fmt.Errorf("view schema %q has a column with no name", name)
@@ -437,52 +473,97 @@ func loadViewSchemas(path string) (map[string][]viewColumn, error) {
 			}
 			seen[c.Name] = true
 		}
+		for _, pc := range v.Partitions {
+			switch {
+			case pc.Name == "":
+				return nil, fmt.Errorf("view schema %q has a partition with no name", name)
+			case seen[pc.Name]:
+				return nil, fmt.Errorf("view schema %q declares %q as both a column and a partition", name, pc.Name)
+			// The name goes into a regular expression matching "<name>=" in
+			// the object path, so it has to be a plain path-segment key.
+			case !isPartitionName(pc.Name):
+				return nil, fmt.Errorf("view schema %q partition %q is not a valid path key (letters, digits, _ and - only)", name, pc.Name)
+			}
+			seen[pc.Name] = true
+		}
 	}
 	return raw.Views, nil
 }
 
-// readerArgs returns the named parameters appended to the reader call, for a
-// view read by reader and optionally declaring cols.
+// isPartitionName reports whether s is safe to interpolate into the partition
+// regular expression and to use as a column alias.
+func isPartitionName(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return s != ""
+}
+
+// viewQuery renders the SELECT that a bootstrapped view is defined as.
 //
 // With no declared schema the view binds from a single file's footer and gets
 // hive_partitioning, stated rather than left to auto-detection so a path that
 // stops looking hive-shaped does not silently drop the partition columns. The
 // cost of this form is that a column the producer added partway through the
 // archive's life is not selectable through the view: whichever file the glob
-// opens first defines the schema. Pass union_by_name on the query that needs
-// to span generations, or declare the columns below.
+// opens first defines the schema.
 //
-// union_by_name is deliberately never set here. It answers that exact problem
-// but makes CREATE VIEW eager — DuckDB reads every footer in the glob to
-// compute the union, which on an archive of any size is one S3 request per
-// object before the process can serve anything.
+// union_by_name is deliberately never set. It answers that exact problem but
+// makes CREATE VIEW eager — DuckDB reads every footer in the glob to compute
+// the union, which on an archive of any size is one S3 request per object
+// before the process can serve anything.
 //
 // With a declared schema the columns are pinned from the file, so they bind
 // without reading the glob at all and a file predating one of them reads it
 // back as NULL. DuckDB refuses `schema` together with hive partitioning and
-// exposes no partition columns alongside it, so a declared schema trades them
-// away: partition-pruning predicates are no longer expressible against the
-// view. Only worth it for a glob that is not partitioned, or one small enough
-// that a full scan is acceptable.
+// exposes no partition columns alongside it, so declaring a schema on its own
+// costs the partition columns and every predicate that prunes on them.
+// Declaring partitions rebuilds them from each object's path instead, which
+// prunes identically: DuckDB pushes the predicate down through the
+// regexp_extract onto the filename it is reading.
 //
 // read_vortex takes none of these, and only read_parquet accepts `schema`
 // (verified against DuckDB 1.5.5; read_csv_auto and read_json_auto reject it),
 // which bootstrapViews enforces rather than silently ignoring.
-func readerArgs(reader string, cols []viewColumn) string {
+func viewQuery(reader, path string, v viewSchema) string {
 	if reader == "read_vortex" {
-		return ""
+		return fmt.Sprintf("SELECT * FROM %s(%s)", reader, sqlString(path))
 	}
-	if len(cols) == 0 {
-		return ", hive_partitioning = true"
+	if len(v.Columns) == 0 {
+		return fmt.Sprintf("SELECT * FROM %s(%s, hive_partitioning = true)", reader, sqlString(path))
 	}
-	entries := make([]string, 0, len(cols))
-	for _, c := range cols {
+
+	entries := make([]string, 0, len(v.Columns))
+	for _, c := range v.Columns {
 		entries = append(entries, fmt.Sprintf(
 			"%s: {'name': %s, 'type': %s, 'default_value': NULL}",
 			sqlString(c.Name), sqlString(c.Name), sqlString(c.Type),
 		))
 	}
-	return ", schema = map { " + strings.Join(entries, ", ") + " }"
+	schemaArg := ", schema = map { " + strings.Join(entries, ", ") + " }"
+
+	if len(v.Partitions) == 0 {
+		return fmt.Sprintf("SELECT * FROM %s(%s%s)", reader, sqlString(path), schemaArg)
+	}
+
+	// filename is what the partition values are read out of, so it has to be
+	// requested and then dropped again — it is plumbing, not a column of the
+	// view.
+	derived := make([]string, 0, len(v.Partitions))
+	for _, pc := range v.Partitions {
+		expr := fmt.Sprintf("regexp_extract(filename, %s, 1)",
+			sqlString(pc.Name+"=([^/]+)"))
+		if pc.Type != "" {
+			expr = fmt.Sprintf("CAST(%s AS %s)", expr, pc.Type)
+		}
+		derived = append(derived, fmt.Sprintf("%s AS %s", expr, sqlIdent(pc.Name)))
+	}
+	return fmt.Sprintf("SELECT * EXCLUDE (filename), %s FROM %s(%s, filename = true%s)",
+		strings.Join(derived, ", "), reader, sqlString(path), schemaArg)
 }
 
 // readerForPath returns the DuckDB read function for the given file path,
