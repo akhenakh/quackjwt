@@ -81,6 +81,17 @@ func main() {
 		}
 	}
 
+	// Server-side FETCH batching. The auth callbacks run on fresh connections,
+	// so like them this is a global rather than a session setting.
+	if cfg.QuackFetchBatchChunks > 0 {
+		q := fmt.Sprintf("SET GLOBAL quack_fetch_batch_chunks = %d;", cfg.QuackFetchBatchChunks)
+		if _, err := db.Exec(q); err != nil {
+			logger.Error("Failed to set quack_fetch_batch_chunks", "value", cfg.QuackFetchBatchChunks, "error", err)
+			os.Exit(1)
+		}
+		logger.Info("FETCH batching configured", "chunks_per_response", cfg.QuackFetchBatchChunks)
+	}
+
 	// Validated eagerly, unlike the S3 work below: it is a local file, and a
 	// malformed one is a config error that should stop the process now rather
 	// than after the listener is up.

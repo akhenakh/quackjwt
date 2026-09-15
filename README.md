@@ -64,6 +64,7 @@ All environment variables follow the same naming and `_FILE` convention as [csi-
 | `S3_CREDENTIAL_CHAIN` | — | — | AWS SDK credential chain to try (semicolon-separated: `env`, `sts`, `instance`, `config`). For IRSA/EKS, set to `sts` or `env;sts;instance`. See [DuckDB httpfs docs](https://duckdb.org/docs/current/core_extensions/httpfs/s3api#credential_chain-provider). |
 | `S3_ENDPOINT` | — | — | Custom S3-compatible endpoint (MinIO, R2, …) |
 | `S3_USE_SSL` | — | `true` | Use HTTPS for S3 endpoint |
+| `QUACK_FETCH_BATCH_CHUNKS` | — | `0` | DataChunks shipped per FETCH response; `0` keeps quack's own default of 12. Raise it when views read many small files — see below |
 | `S3_VIEWS` | — | — | Comma-separated `name=path` pairs; views are auto-created with the reader matched to the file extension (`.parquet` → `read_parquet`, `.vortex`/`.vx` → `read_vortex`, `.csv` → `read_csv_auto`, etc.) |
 | `VIEW_SCHEMA_PATH` | — | — | YAML file declaring the columns of named views, pinning their schema without reading the whole glob, plus the partition columns to rebuild from each object's path — see below |
 
@@ -205,6 +206,20 @@ Two ways to read across that boundary:
   $$);
   ```
 - **Per view** — declare the columns in `VIEW_SCHEMA_PATH` (below), which pins them without reading the glob.
+
+### `QUACK_FETCH_BATCH_CHUNKS`
+
+How many DataChunks the server ships per FETCH response. Unset keeps quack's own default of 12.
+
+This matters when a view's underlying objects are small. DuckDB emits at least one DataChunk per file, so an archive of many small objects produces many nearly-empty chunks, and at 12 chunks per response a result comes back in hundreds of HTTP round trips whose latency dominates everything else — the scan itself can be a rounding error beside it. Measured on 4000 single-row Parquet files:
+
+| `QUACK_FETCH_BATCH_CHUNKS` | FETCH round trips |
+| --- | --- |
+| unset (12) | 356 |
+| 256 | 38 |
+| 2000 | 24 |
+
+It trades memory for round trips, and the trade depends entirely on how full the chunks are: 256 chunks of two rows is nothing, 256 *full* chunks is ~500k rows buffered for one response. Size it against the archive the views actually read, and give the container headroom for the largest response it can now produce. Fixing the object sizes upstream removes the need for it.
 
 ### `VIEW_SCHEMA_PATH`
 

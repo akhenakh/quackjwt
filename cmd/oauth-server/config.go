@@ -94,6 +94,18 @@ type Config struct {
 	// the glob opens first, so a column the producer added later is not
 	// selectable through them.
 	ViewSchemaPath string `env:"VIEW_SCHEMA_PATH"`
+
+	// QuackFetchBatchChunks is how many DataChunks the server ships per FETCH
+	// response (quack's own default is 12). Zero leaves that default alone.
+	//
+	// It matters when a view's underlying files are small. DuckDB emits at
+	// least one DataChunk per file, so an archive of many small objects yields
+	// many nearly-empty chunks, and at 12 chunks per response the result comes
+	// back in hundreds of HTTP round trips whose latency dominates everything
+	// else. Raising it trades memory for round trips: a response now buffers up
+	// to this many chunks, which is cheap when chunks hold a handful of rows
+	// and expensive when they are full (~2048 rows each).
+	QuackFetchBatchChunks uint64 `env:"QUACK_FETCH_BATCH_CHUNKS" envDefault:"0"`
 }
 
 // resolveSecretValue reads a secret from a file if filePath is set, otherwise
