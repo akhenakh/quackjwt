@@ -360,9 +360,27 @@ func TestBootstrapViewsRejectsUnusableSchema(t *testing.T) {
 	})
 
 	t.Run("reader cannot take a schema", func(t *testing.T) {
-		cfg := Config{S3Views: "flights=" + filepath.Join(dir, "*.csv"), ViewSchemaPath: schemaFile}
+		cfg := Config{S3Views: "flights=" + filepath.Join(dir, "*.vortex"), ViewSchemaPath: schemaFile}
 		if err := bootstrapViews(db, cfg); err == nil {
-			t.Error("expected an error for a declared schema on read_csv_auto")
+			t.Error("expected an error for a declared schema on read_vortex")
+		}
+	})
+
+	t.Run("csv reader accepts a schema", func(t *testing.T) {
+		csv := filepath.Join(dir, "flights.csv")
+		if err := os.WriteFile(csv, []byte("a\n1\n"), 0o644); err != nil {
+			t.Fatalf("write csv: %v", err)
+		}
+		cfg := Config{S3Views: "flights=" + csv, ViewSchemaPath: schemaFile}
+		if err := bootstrapViews(db, cfg); err != nil {
+			t.Fatalf("bootstrapViews with a csv schema: %v", err)
+		}
+		var typ string
+		if err := db.QueryRow(`SELECT data_type FROM duckdb_columns() WHERE table_name = 'flights' AND column_name = 'a'`).Scan(&typ); err != nil {
+			t.Fatalf("describe views: %v", err)
+		}
+		if typ != "VARCHAR" {
+			t.Fatalf("column a type = %q, want VARCHAR from the declared schema", typ)
 		}
 	})
 }

@@ -188,6 +188,36 @@ func TestQuackJWT_EndToEnd(t *testing.T) {
 		}
 	})
 
+	// Quack 2.0 needs these to ATTACH and to wrap a remote scan. They are
+	// ungated, but only as exact statements: anything appended to them must
+	// fall back through the grant checks (or be denied outright).
+	t.Run("Quack catalog and transaction statements allowed", func(t *testing.T) {
+		for _, q := range []string{
+			quackSchemaLoadQuery,
+			quackTablesLoadQuery,
+			"BEGIN TRANSACTION",
+			"COMMIT",
+			"ROLLBACK",
+		} {
+			if !authzAllows(q) {
+				t.Errorf("quack protocol statement should be authorized: %q", q)
+			}
+		}
+	})
+
+	t.Run("Catalog introspection with appended SQL denied", func(t *testing.T) {
+		for _, q := range []string{
+			`SELECT sql FROM duckdb_views()`,
+			quackTablesLoadQuery + ` UNION ALL SELECT 1, sql, 'view' FROM duckdb_views()`,
+			quackSchemaLoadQuery + `; SELECT * FROM secret_financials`,
+			`BEGIN TRANSACTION; SELECT * FROM secret_financials`,
+		} {
+			if authzAllows(q) {
+				t.Errorf("query extending an ungated statement must be denied: %q", q)
+			}
+		}
+	})
+
 	t.Run("Bypass via CTE named after granted table", func(t *testing.T) {
 		if authzAllows(`WITH public_metrics AS (SELECT * FROM secret_financials) SELECT * FROM public_metrics`) {
 			t.Fatal("CTE-named-after-granted-table bypass should be denied")

@@ -70,8 +70,11 @@ type Config struct {
 	S3Endpoint string `env:"S3_ENDPOINT"`
 	// S3CredentialChain is the AWS SDK credential chain to use
 	// (semicolon-separated). Defaults to DuckDB's built-in default chain.
-	// For IRSA/EKS Pod Identity, set to "sts" or "env;sts;instance".
-	// See DuckDB httpfs docs for valid chain names.
+	// For IRSA (EKS) set "web_identity"; for EKS Pod Identity or ECS task
+	// roles set "container"; for an EC2 instance profile set "instance".
+	// "sts" assumes a role and requires an ASSUME_ROLE_ARN, which this config
+	// does not expose, so it is not used here. See the DuckDB aws extension
+	// docs for the full list.
 	S3CredentialChain string `env:"S3_CREDENTIAL_CHAIN"`
 	// S3UseSSL controls whether HTTPS is used for the S3 endpoint.
 	S3UseSSL bool `env:"S3_USE_SSL" envDefault:"true"`
@@ -95,17 +98,18 @@ type Config struct {
 	// selectable through them.
 	ViewSchemaPath string `env:"VIEW_SCHEMA_PATH"`
 
-	// QuackFetchBatchChunks is how many DataChunks the server ships per FETCH
-	// response (quack's own default is 12). Zero leaves that default alone.
+	// QuackTargetBatchBytes is the target size in bytes of one FETCH wire
+	// payload (one rebalanced batch). Zero leaves quack's own default alone
+	// (32 MiB in DuckDB 2.0).
 	//
-	// It matters when a view's underlying files are small. DuckDB emits at
-	// least one DataChunk per file, so an archive of many small objects yields
-	// many nearly-empty chunks, and at 12 chunks per response the result comes
-	// back in hundreds of HTTP round trips whose latency dominates everything
-	// else. Raising it trades memory for round trips: a response now buffers up
-	// to this many chunks, which is cheap when chunks hold a handful of rows
-	// and expensive when they are full (~2048 rows each).
-	QuackFetchBatchChunks uint64 `env:"QUACK_FETCH_BATCH_CHUNKS" envDefault:"0"`
+	// DuckDB cuts a batch when it reaches this many bytes, so many small
+	// DataChunks — an archive of many small Parquet files emits at least one
+	// chunk per file — are packed together rather than shipped one response
+	// each. Raising it reduces round trips at the cost of buffering a larger
+	// response per FETCH; lowering it does the reverse. The server also holds
+	// each response under `quack_server_stream_buffer_bytes` (256 MiB, capped
+	// at a quarter of memory_limit), so size this against the container.
+	QuackTargetBatchBytes uint64 `env:"QUACK_TARGET_BATCH_BYTES" envDefault:"0"`
 }
 
 // resolveSecretValue reads a secret from a file if filePath is set, otherwise

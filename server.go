@@ -8,8 +8,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -48,10 +50,65 @@ const (
 	pathStringPattern = `(?i)\bfrom\s+\x27[^\x27]*\x27|\bjoin\s+\x27[^\x27]*\x27|,\s*\x27(?:/[^\x27]*|[^\x27]*://[^\x27]*|[^\x27]*\.(?:parquet|csv|json|avro|arrow|feather|ndjson|tsv|orc|txt|sqlite|vortex)[^\x27]*)\x27`
 )
 
+// The statements Quack's client sends outside the user's SQL, which bypass
+// table grants:
+//
+//   - the catalog-loading queries issued during ATTACH. They are matched
+//     exactly (after whitespace normalization) rather than by function name: a
+//     pattern that admits duckdb_views() also admits `SELECT sql FROM
+//     duckdb_views()`, which would expose view definitions and the S3 paths in
+//     them. Pinned to Quack protocol 3 (DuckDB 2.0); an upstream change to
+//     either query makes ATTACH fail closed until these are updated.
+//   - the transaction control statements that wrap a remote scan. They touch no
+//     data on their own, and every data query inside the transaction is still
+//     authorized separately.
+const (
+	quackSchemaLoadQuery = `
+WITH RECURSIVE schema_tree AS (
+	SELECT oid, database_name, [schema_name] AS schema_path
+	FROM duckdb_schemas()
+	WHERE parent_schema_oid IS NULL
+	UNION ALL
+	SELECT nested.oid, nested.database_name, list_append(parent.schema_path, nested.schema_name)
+	FROM duckdb_schemas() nested
+	JOIN schema_tree parent ON nested.parent_schema_oid = parent.oid
+)
+SELECT oid, database_name, schema_path, current_database()
+FROM schema_tree
+WHERE database_name NOT IN ('system', 'temp')
+ORDER BY (database_name = current_database()) DESC, database_name, length(schema_path), schema_path
+	`
+
+	quackTablesLoadQuery = `
+SELECT schema_oid, sql, 'table'
+FROM duckdb_tables()
+UNION ALL
+SELECT schema_oid, view_name, 'view'
+FROM duckdb_views()
+	`
+)
+
+// quackControlQueries are sent verbatim by Quack's client.
+var quackControlQueries = []string{"BEGIN TRANSACTION", "COMMIT", "ROLLBACK"}
+
 const (
 	defaultSessionTTL    = time.Hour
 	defaultSweepInterval = 10 * time.Minute
 )
+
+// normalizeQuery collapses whitespace runs the same way the authz macro does.
+func normalizeQuery(q string) string { return strings.Join(strings.Fields(q), " ") }
+
+// ungatedQueriesList renders the control statements and catalog-load queries
+// as a SQL literal list, for exact comparison against the normalized req_query.
+func ungatedQueriesList() string {
+	queries := append([]string{quackSchemaLoadQuery, quackTablesLoadQuery}, quackControlQueries...)
+	parts := make([]string, len(queries))
+	for i, q := range queries {
+		parts[i] = "'" + strings.ReplaceAll(normalizeQuery(q), "'", "''") + "'"
+	}
+	return strings.Join(parts, ", ")
+}
 
 // NewServer initializes the wrapper.
 func NewServer(db *sql.DB, quackURI string, verify TokenVerifier) *Server {
@@ -159,12 +216,12 @@ func (s *Server) Start() error {
 	// at least one granted table, references NO non-granted table (reading a
 	// table always requires naming it), and invokes no file/system function that
 	// could bypass table-level grants (e.g. read_csv_auto, duckdb_settings).
-	// Quack's internal ATTACH introspection is still permitted via the LIKE
-	// clauses.
+	// Quack's own ATTACH-time catalog queries and transaction control
+	// statements are matched exactly and allowed; everything else referencing
+	// data is gated by the grants below.
 	authzMacro := fmt.Sprintf(`
 		CREATE OR REPLACE MACRO quack_jwt_authz(req_sid, req_query) AS (
-			req_query LIKE '%%information_schema.schemata%%' OR
-			req_query LIKE '%%duckdb_tables()%%' OR
+			trim(regexp_replace(req_query, '\s+', ' ', 'g')) IN (%s) OR
 			(
 				EXISTS (
 					SELECT 1
@@ -188,7 +245,7 @@ func (s *Server) Start() error {
 				AND NOT regexp_matches(req_query, '%s')
 			)
 		);
-	`, dangerousFnPattern, ddlPattern, pathStringPattern)
+	`, ungatedQueriesList(), dangerousFnPattern, ddlPattern, pathStringPattern)
 	if _, err := s.db.Exec(authzMacro); err != nil {
 		return fmt.Errorf("failed to create authz macro: %w", err)
 	}
@@ -305,6 +362,12 @@ func (s *Server) SyncPermissions(grants map[string][]string) error {
 // It first verifies req_server_token (srv) against the server secret so that
 // only Quack — not a client invoking the macro directly, nor a stray local
 // process — can establish a session.
+//
+// Every denial answers HTTP 200 with {"allowed": false}. DuckDB 2.0 raises on
+// a non-2xx response from read_json_auto and Quack forwards the callback error
+// to the client verbatim, URL included — which would leak the control-plane
+// port and the srv token in it. An in-body false keeps the client message a
+// plain "Authentication failed".
 func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -314,22 +377,18 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case sid == "", token == "", srv == "":
-		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]bool{"allowed": false})
 		return
 	case len(sid) > 256, len(token) > 1<<15, len(srv) > 256:
-		w.WriteHeader(http.StatusRequestEntityTooLarge)
 		_ = json.NewEncoder(w).Encode(map[string]bool{"allowed": false})
 		return
 	case subtle.ConstantTimeCompare([]byte(srv), []byte(s.serverSecret)) != 1:
-		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(map[string]bool{"allowed": false})
 		return
 	}
 
 	sub, err := s.verify(token)
 	if err != nil {
-		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(map[string]bool{"allowed": false})
 		return
 	}
@@ -340,11 +399,10 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		VALUES (?, ?, ?)
 		ON CONFLICT (sid) DO UPDATE SET sub = excluded.sub, created_at = excluded.created_at;
 	`, sid, sub, time.Now().UTC()); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		log.Printf("quackjwt: recording session %q failed: %v", sid, err)
 		_ = json.NewEncoder(w).Encode(map[string]bool{"allowed": false})
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]bool{"allowed": true})
 }

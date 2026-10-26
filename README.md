@@ -14,6 +14,8 @@ The `cmd/oauth-server` binary is a batteries-included deployment: give it a JWT 
 go build -o oauth-server ./cmd/oauth-server
 ```
 
+> duckdb-go v2.20000.0 ships its native libraries as Go modules from `go.duckdb.org`. A restricted `GOPROXY` must allow that path.
+
 Create `perm.yaml`:
 
 ```yaml
@@ -61,10 +63,10 @@ All environment variables follow the same naming and `_FILE` convention as [csi-
 | `SESSION_TTL` | — | `1h` | Idle session reap interval |
 | `LOG_LEVEL` | — | `INFO` | `DEBUG`, `INFO`, `WARN`, `ERROR` |
 | `S3_REGION` | — | — | AWS region; setting this triggers S3 bootstrap |
-| `S3_CREDENTIAL_CHAIN` | — | — | AWS SDK credential chain to try (semicolon-separated: `env`, `sts`, `instance`, `config`). For IRSA/EKS, set to `sts` or `env;sts;instance`. See [DuckDB httpfs docs](https://duckdb.org/docs/current/core_extensions/httpfs/s3api#credential_chain-provider). |
+| `S3_CREDENTIAL_CHAIN` | — | — | AWS SDK credential chain to try (semicolon-separated). In DuckDB 2.0 `web_identity` is the IRSA chain (EKS), `container` covers EKS Pod Identity and ECS task roles, `instance` an EC2 instance profile, and `sts` assumes a role and needs an `ASSUME_ROLE_ARN` this config does not set. See [DuckDB aws docs](https://duckdb.org/docs/2.0/core_extensions/aws#credential_chain-provider). |
 | `S3_ENDPOINT` | — | — | Custom S3-compatible endpoint (MinIO, R2, …) |
 | `S3_USE_SSL` | — | `true` | Use HTTPS for S3 endpoint |
-| `QUACK_FETCH_BATCH_CHUNKS` | — | `0` | DataChunks shipped per FETCH response; `0` keeps quack's own default of 12. Raise it when views read many small files — see below |
+| `QUACK_TARGET_BATCH_BYTES` | — | `0` | Target size in bytes of one FETCH wire payload; `0` keeps quack's own default of 32 MiB. See below |
 | `S3_VIEWS` | — | — | Comma-separated `name=path` pairs; views are auto-created with the reader matched to the file extension (`.parquet` → `read_parquet`, `.vortex`/`.vx` → `read_vortex`, `.csv` → `read_csv_auto`, etc.) |
 | `VIEW_SCHEMA_PATH` | — | — | YAML file declaring the columns of named views, pinning their schema without reading the whole glob, plus the partition columns to rebuild from each object's path — see below |
 
@@ -150,7 +152,7 @@ When kubelet updates the ConfigMap it atomically swaps the symlink behind `perm.
 
 ## Client usage
 
-Clients need standard DuckDB (v1.5.3+) with the `quack` extension installed:
+Clients need standard DuckDB v2.0+ with the `quack` extension installed:
 
 ```sql
 INSTALL quack;
@@ -180,6 +182,8 @@ FROM quack_query(
 );
 ```
 
+Quack protocol 3 ships with DuckDB 2.0, and both ends must speak it — a 1.5 client cannot attach to a 2.0 server. The server's ungated-statement allowlist is pinned to the catalog queries this client version sends, so a future protocol change fails closed instead of silently opening up.
+
 ## S3 / Parquet use case
 
 Set `S3_REGION` and `S3_VIEWS` to let the server auto-create the DuckDB secret and views on startup — no manual SQL needed. The reader function is chosen from the file extension automatically:
@@ -189,7 +193,7 @@ export S3_REGION=us-east-1
 export S3_VIEWS='sales=s3://acme-sales/**/*.parquet,ops_logs=s3://acme-ops-logs/*.parquet,events=s3://acme-events/**/*.vortex'
 ```
 
-The server creates `CREATE SECRET IF NOT EXISTS quackjwt_s3` (using the ambient AWS credential chain) and a `CREATE VIEW IF NOT EXISTS` for each entry, using `read_parquet` for `.parquet` files and `read_vortex` for `.vortex`/`.vx` files. Required DuckDB extensions (including `vortex`) are installed and loaded automatically. Views are idempotent across restarts.
+The server creates `CREATE SECRET IF NOT EXISTS quackjwt_s3` (using the ambient AWS credential chain) and a `CREATE VIEW IF NOT EXISTS` for each entry, using `read_parquet` for `.parquet` files and `read_vortex` for `.vortex`/`.vx` files. Required DuckDB extensions (including `vortex`, and `aws` for the credential chain in DuckDB 2.0) are installed and loaded automatically. Views are idempotent across restarts.
 
 Views are bootstrapped **after** the Quack listener is up, not before it. Creating them talks to S3, and how long that takes scales with the archive; held in front of the listener it delays the port opening and a liveness probe kills the container before the first log line is written. The cost is a window after startup where a query naming a view fails to bind — visible in the logs, unlike a silent restart loop.
 
@@ -207,23 +211,17 @@ Two ways to read across that boundary:
   ```
 - **Per view** — declare the columns in `VIEW_SCHEMA_PATH` (below), which pins them without reading the glob.
 
-### `QUACK_FETCH_BATCH_CHUNKS`
+### `QUACK_TARGET_BATCH_BYTES`
 
-How many DataChunks the server ships per FETCH response. Unset keeps quack's own default of 12.
+The target size in bytes of one FETCH wire payload. Unset keeps quack's own default of 32 MiB.
 
-This matters when a view's underlying objects are small. DuckDB emits at least one DataChunk per file, so an archive of many small objects produces many nearly-empty chunks, and at 12 chunks per response a result comes back in hundreds of HTTP round trips whose latency dominates everything else — the scan itself can be a rounding error beside it. Measured on 4000 single-row Parquet files:
+This replaced the chunk-count batching of earlier quack versions. DuckDB cuts a batch when it reaches this size, so an archive of many small objects — each file emits at least one DataChunk — is packed into far fewer responses instead of one nearly-empty chunk per file, and the round-trip storm that used to need tuning is gone by default.
 
-| `QUACK_FETCH_BATCH_CHUNKS` | FETCH round trips |
-| --- | --- |
-| unset (12) | 356 |
-| 256 | 38 |
-| 2000 | 24 |
-
-It trades memory for round trips, and the trade depends entirely on how full the chunks are: 256 chunks of two rows is nothing, 256 *full* chunks is ~500k rows buffered for one response. Size it against the archive the views actually read, and give the container headroom for the largest response it can now produce. Fixing the object sizes upstream removes the need for it.
+Tune it only around memory: a response buffers up to one batch per connection, under the separate `quack_server_stream_buffer_bytes` limit (256 MiB by default, capped at a quarter of `memory_limit`). Raising `QUACK_TARGET_BATCH_BYTES` cuts round trips on large results while letting each response grow; lowering it does the reverse. Size it against the container's headroom. Fixing the object sizes upstream removes the need for it.
 
 ### `VIEW_SCHEMA_PATH`
 
-A YAML file declaring the columns of one or more views by name. A view listed there is created with `read_parquet`'s `schema` argument: the columns bind from the file rather than from the data, and a file written before one of them existed reads it back as NULL.
+A YAML file declaring the columns of one or more views by name. A view listed there is created with the reader's `schema` argument (`read_parquet`, `read_csv_auto` and `read_json_auto` take one; `read_vortex` does not): the columns bind from the declaration rather than from the data, and a file written before one of them existed reads it back as NULL.
 
 ```yaml
 views:
@@ -307,7 +305,7 @@ The `filename` column that carries the values is plumbing and is dropped from th
 
 The bare-list spelling (`flights:` followed directly by the column list) still means columns only, and is equivalent to a `columns:` key with no `partitions:`.
 
-Only `read_parquet` accepts `schema`. A schema declared for a view read by `read_csv_auto`, `read_json_auto` or `read_vortex`, or naming a view absent from `S3_VIEWS`, is refused at startup rather than silently ignored.
+Only `read_vortex` rejects `schema`. A schema declared for a view read by `read_vortex`, or naming a view absent from `S3_VIEWS`, is refused at startup rather than silently ignored.
 
 On Kubernetes, pair this with an IAM-annotated service account (IRSA) to scope the pod to the exact buckets:
 
@@ -316,7 +314,7 @@ env:
   - name: S3_REGION
     value: "us-east-1"
   - name: S3_CREDENTIAL_CHAIN
-    value: "sts"             # use "env;sts;instance" for a fallback chain
+    value: "web_identity"    # IRSA; use "container" for EKS Pod Identity, "instance" for EC2
   - name: S3_VIEWS
     value: "sales=s3://acme-sales/**/*.parquet,ops_logs=s3://acme-ops-logs/*.parquet,events=s3://acme-events/**/*.vortex"
   # Non-AWS endpoints:
@@ -403,6 +401,8 @@ The Quack protocol speaks plain HTTP. Always front the oauth-server with a TLS-t
 
 ### Authorization model
 The authz macro enforces a **default-deny** policy: a query is authorized only if it references at least one granted table, references no non-granted table, invokes no file/system function (`read_parquet`, `duckdb_settings`, …), and uses no `FROM '<path>'` / `JOIN '<path>'` string-source shorthand. The classic bypasses — commenting a granted name, naming a CTE/alias after a granted table, smuggling `read_csv_auto` — are all blocked because the prohibited token still appears in the query text.
+
+The only ungated statements are the ones Quack's client sends on its own: the two ATTACH-time catalog queries, and `BEGIN TRANSACTION` / `COMMIT` / `ROLLBACK`. They are matched as exact statements after whitespace normalization, never by function name — allowing `duckdb_views()` by pattern would also allow `SELECT sql FROM duckdb_views()`, which exposes view definitions and the bucket paths in them.
 
 Regex-based authorization can never be as rigorous as a real SQL parser; treat it as an analytical boundary and always combine it with defense-in-depth measures.
 

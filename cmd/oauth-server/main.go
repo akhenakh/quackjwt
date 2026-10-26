@@ -83,13 +83,13 @@ func main() {
 
 	// Server-side FETCH batching. The auth callbacks run on fresh connections,
 	// so like them this is a global rather than a session setting.
-	if cfg.QuackFetchBatchChunks > 0 {
-		q := fmt.Sprintf("SET GLOBAL quack_fetch_batch_chunks = %d;", cfg.QuackFetchBatchChunks)
+	if cfg.QuackTargetBatchBytes > 0 {
+		q := fmt.Sprintf("SET GLOBAL quack_target_batch_bytes = %d;", cfg.QuackTargetBatchBytes)
 		if _, err := db.Exec(q); err != nil {
-			logger.Error("Failed to set quack_fetch_batch_chunks", "value", cfg.QuackFetchBatchChunks, "error", err)
+			logger.Error("Failed to set quack_target_batch_bytes", "value", cfg.QuackTargetBatchBytes, "error", err)
 			os.Exit(1)
 		}
-		logger.Info("FETCH batching configured", "chunks_per_response", cfg.QuackFetchBatchChunks)
+		logger.Info("FETCH batching configured", "target_batch_bytes", cfg.QuackTargetBatchBytes)
 	}
 
 	// Validated eagerly, unlike the S3 work below: it is a local file, and a
@@ -387,7 +387,7 @@ func bootstrapViews(db *sql.DB, cfg Config) error {
 
 	for name, path := range views {
 		reader := readerForPath(path)
-		if len(schemas[name].Columns) > 0 && reader != "read_parquet" {
+		if len(schemas[name].Columns) > 0 && reader == "read_vortex" {
 			return fmt.Errorf("view %q declares a schema but reads with %s, which does not accept one", name, reader)
 		}
 		q := fmt.Sprintf("CREATE VIEW IF NOT EXISTS %s AS %s;",
@@ -537,9 +537,10 @@ func isPartitionName(s string) bool {
 // prunes identically: DuckDB pushes the predicate down through the
 // regexp_extract onto the filename it is reading.
 //
-// read_vortex takes none of these, and only read_parquet accepts `schema`
-// (verified against DuckDB 1.5.5; read_csv_auto and read_json_auto reject it),
-// which bootstrapViews enforces rather than silently ignoring.
+// read_vortex takes none of these, and it is the one reader here that rejects
+// `schema` (verified against DuckDB 2.0; read_csv_auto and read_json_auto
+// accept it as of 2.0), which bootstrapViews enforces rather than silently
+// ignoring.
 func viewQuery(reader, path string, v viewSchema) string {
 	if reader == "read_vortex" {
 		return fmt.Sprintf("SELECT * FROM %s(%s)", reader, sqlString(path))
