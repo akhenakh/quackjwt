@@ -132,6 +132,53 @@ func TestBootstrapViewsBindsFromOneFile(t *testing.T) {
 	}
 }
 
+// TestBootstrapViewsCreatesSecureViews pins the plan/statistics boundary: a
+// regular view exposes its definition through EXPLAIN and stats(), and a
+// pre-secure-view database may still hold regular views.
+func TestBootstrapViewsCreatesSecureViews(t *testing.T) {
+	db := openDuckDB(t)
+	glob := twoGenerationArchive(t, db)
+
+	if err := bootstrapViews(db, Config{S3Views: fmt.Sprintf("flights=%s", glob)}); err != nil {
+		t.Fatalf("bootstrapViews: %v", err)
+	}
+
+	var sqlText string
+	if err := db.QueryRow(
+		`SELECT sql FROM duckdb_views() WHERE view_name = 'flights' AND NOT internal`,
+	).Scan(&sqlText); err != nil {
+		t.Fatalf("read view definition: %v", err)
+	}
+	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sqlText)), "CREATE SECURE VIEW") {
+		t.Errorf("view is not secure: %s", sqlText)
+	}
+}
+
+// TestBootstrapViewsKeepsExistingView pins the upgrade behavior: IF NOT EXISTS
+// leaves a pre-existing (non-secure) view alone and logs a warning, rather than
+// silently replacing an operator's definition.
+func TestBootstrapViewsKeepsExistingView(t *testing.T) {
+	db := openDuckDB(t)
+	glob := twoGenerationArchive(t, db)
+
+	if _, err := db.Exec(`CREATE VIEW flights AS SELECT 1 AS x`); err != nil {
+		t.Fatalf("create existing view: %v", err)
+	}
+	if err := bootstrapViews(db, Config{S3Views: fmt.Sprintf("flights=%s", glob)}); err != nil {
+		t.Fatalf("bootstrapViews: %v", err)
+	}
+
+	var sqlText string
+	if err := db.QueryRow(
+		`SELECT sql FROM duckdb_views() WHERE view_name = 'flights' AND NOT internal`,
+	).Scan(&sqlText); err != nil {
+		t.Fatalf("read view definition: %v", err)
+	}
+	if !strings.Contains(sqlText, "SELECT 1 AS x") {
+		t.Errorf("existing view was replaced: %s", sqlText)
+	}
+}
+
 // TestBootstrapViewsDeclaredSchema covers VIEW_SCHEMA_PATH: the declared
 // columns bind without walking the glob, and a file written before a column
 // existed reads it back as NULL rather than making it unselectable.

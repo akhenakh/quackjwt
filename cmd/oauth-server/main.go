@@ -56,6 +56,11 @@ func main() {
 		os.Exit(1)
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	slog.SetDefault(logger)
+
+	if os.Getenv("QUACK_FETCH_BATCH_CHUNKS") != "" {
+		logger.Warn("QUACK_FETCH_BATCH_CHUNKS is gone in DuckDB 2.0 (and ignored here); use QUACK_TARGET_BATCH_BYTES, in bytes")
+	}
 
 	db, err := sql.Open("duckdb", cfg.DuckDBPath)
 	if err != nil {
@@ -81,15 +86,27 @@ func main() {
 		}
 	}
 
-	// Server-side FETCH batching. The auth callbacks run on fresh connections,
-	// so like them this is a global rather than a session setting.
-	if cfg.QuackTargetBatchBytes > 0 {
-		q := fmt.Sprintf("SET GLOBAL quack_target_batch_bytes = %d;", cfg.QuackTargetBatchBytes)
+	// Server-side FETCH batching and resource caps. The auth callbacks run on
+	// fresh connections, so like them these are globals rather than session
+	// settings.
+	globalSettings := []struct {
+		name  string
+		value uint64
+	}{
+		{"quack_target_batch_bytes", cfg.QuackTargetBatchBytes},
+		{"quack_server_max_connections", cfg.QuackServerMaxConnections},
+		{"quack_server_stream_buffer_bytes", cfg.QuackServerStreamBufferBytes},
+	}
+	for _, st := range globalSettings {
+		if st.value == 0 {
+			continue
+		}
+		q := fmt.Sprintf("SET GLOBAL %s = %d;", st.name, st.value)
 		if _, err := db.Exec(q); err != nil {
-			logger.Error("Failed to set quack_target_batch_bytes", "value", cfg.QuackTargetBatchBytes, "error", err)
+			logger.Error("Failed to set quack setting", "setting", st.name, "value", st.value, "error", err)
 			os.Exit(1)
 		}
-		logger.Info("FETCH batching configured", "target_batch_bytes", cfg.QuackTargetBatchBytes)
+		logger.Info("Quack setting configured", "setting", st.name, "value", st.value)
 	}
 
 	// Validated eagerly, unlike the S3 work below: it is a local file, and a
@@ -349,9 +366,10 @@ func refreshS3Secret(db *sql.DB, cfg Config) error {
 }
 
 // bootstrapViews parses S3_VIEWS, auto-installs any needed extensions, and
-// creates a VIEW IF NOT EXISTS for each entry. The reader function is chosen
-// from the file extension (e.g. .parquet → read_parquet, .vortex →
-// read_vortex).
+// creates a SECURE VIEW IF NOT EXISTS for each entry. SECURE keeps the view
+// definition (bucket paths, filters) out of EXPLAIN output and planner
+// statistics. The reader function is chosen from the file extension
+// (e.g. .parquet → read_parquet, .vortex → read_vortex).
 func bootstrapViews(db *sql.DB, cfg Config) error {
 	views, err := parseS3Views(cfg.S3Views)
 	if err != nil {
@@ -390,14 +408,31 @@ func bootstrapViews(db *sql.DB, cfg Config) error {
 		if len(schemas[name].Columns) > 0 && reader == "read_vortex" {
 			return fmt.Errorf("view %q declares a schema but reads with %s, which does not accept one", name, reader)
 		}
-		q := fmt.Sprintf("CREATE VIEW IF NOT EXISTS %s AS %s;",
+		q := fmt.Sprintf("CREATE SECURE VIEW IF NOT EXISTS %s AS %s;",
 			sqlIdent(name), viewQuery(reader, path, schemas[name]),
 		)
 		if _, err := db.Exec(q); err != nil {
 			return fmt.Errorf("create view %s: %w", name, err)
 		}
+		warnIfViewNotSecure(db, name)
 	}
 	return nil
+}
+
+// warnIfViewNotSecure reports a view that predates SECURE VIEW. IF NOT EXISTS
+// leaves an existing definition alone, so a persistent database keeps a regular
+// view (and exposes its plan and statistics) until the operator drops it.
+func warnIfViewNotSecure(db *sql.DB, name string) {
+	var sqlText string
+	if err := db.QueryRow(
+		`SELECT sql FROM duckdb_views() WHERE view_name = ? AND NOT internal`, name,
+	).Scan(&sqlText); err != nil {
+		return
+	}
+	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sqlText)), "CREATE SECURE") {
+		slog.Warn("S3 view exists but is not a SECURE VIEW; drop and recreate it to hide its plan and statistics",
+			"view", name)
+	}
 }
 
 // viewColumn is one declared column of a view, in the order it should appear.

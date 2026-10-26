@@ -110,6 +110,17 @@ type Config struct {
 	// each response under `quack_server_stream_buffer_bytes` (256 MiB, capped
 	// at a quarter of memory_limit), so size this against the container.
 	QuackTargetBatchBytes uint64 `env:"QUACK_TARGET_BATCH_BYTES" envDefault:"0"`
+
+	// QuackServerMaxConnections caps concurrent Quack clients. Zero leaves
+	// quack's default (1024). Each live client holds a DuckDB connection and a
+	// result buffer, so this is the first bound on memory under load.
+	QuackServerMaxConnections uint64 `env:"QUACK_SERVER_MAX_CONNECTIONS" envDefault:"0"`
+
+	// QuackServerStreamBufferBytes is the per-stream server buffer budget in
+	// bytes. Zero leaves quack's default (256 MiB, further capped at a quarter
+	// of memory_limit). Lower it to bound the worst-case memory an authenticated
+	// client can hold with a large result or insert stream.
+	QuackServerStreamBufferBytes uint64 `env:"QUACK_SERVER_STREAM_BUFFER_BYTES" envDefault:"0"`
 }
 
 // resolveSecretValue reads a secret from a file if filePath is set, otherwise

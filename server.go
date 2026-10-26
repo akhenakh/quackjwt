@@ -3,6 +3,7 @@ package quackjwt
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
@@ -23,23 +24,52 @@ type TokenVerifier func(token string) (sub string, err error)
 
 // Server wraps a DuckDB Quack instance with JWT-based access control.
 type Server struct {
-	db            *sql.DB
-	verify        TokenVerifier
-	quackURI      string
-	serverSecret  string
-	controlServer *http.Server
-	sessionTTL    time.Duration
-	sweepCancel   context.CancelFunc
+	db               *sql.DB
+	verify           TokenVerifier
+	quackURI         string
+	serverSecret     string
+	serverSecretHash string
+	controlServer    *http.Server
+	sessionTTL       time.Duration
+	sweepCancel      context.CancelFunc
 }
 
-// Authorization patterns. A query is denied if it calls a file/system function
-// (arbitrary file/network read or internal-state leakage) or begins with a
-// non-SELECT statement. Matched as function-call / statement-start forms to
-// avoid false positives on string literals.
+// Authorization patterns.
+//
+// dangerousFnPattern denies any function that can read files/network/object
+// storage, reach the secrets manager or logs, or manage the quack server
+// itself. It is intentionally broad: read_* covers every reader (including
+// aliases and extension readers such as read_xlsx), *_scan covers the
+// parquet_scan / sqlite_scan / iceberg_scan / delta_scan family, duckdb_*
+// covers the metadata and log functions, and quack_* covers server management
+// (quack_stop, quack_serve, quack_generate_keys, quack_active_connections, …).
+// A false positive is a denial, not an escalation.
+//
+// ddlPattern is a second layer for statements that do not parse as SELECT; the
+// primary statement gate is quackJWTSelectOnlyMacro below, because a leading
+// comment defeats any statement-prefix regex.
 const (
-	dangerousFnPattern = `(?i)\b(read_csv|read_csv_auto|read_json|read_json_auto|read_json_objects|read_json_objects_auto|read_parquet|read_parquet_metadata|read_vortex|read_blob|read_blob_auto|read_text|read_text_auto|read_sql|read_ndjson|read_arrow|read_ipc|read_feather|read_avro|read_sqlite|read_postgres|read_mysql|read_duckdb|read_wkb|read_wkt|read_spatial|read_iceberg|st_read|glob|glob_each|list_glob|query_table|query_table_function|duckdb_settings|duckdb_functions|duckdb_secrets|duckdb_persistent_secrets|duckdb_variables|duckdb_memory|duckdb_extensions|duckdb_databases|duckdb_schemas|duckdb_views|duckdb_columns|duckdb_indexes|duckdb_constraints|duckdb_dependencies|duckdb_keywords|duckdb_types|duckdb_partition_info|duckdb_partitions|duckdb_table_info|quack_server_list|quack_identify|quack_clear_cache|quack_query|quack_query_by_name)\s*\(`
+	dangerousFnPattern = `(?i)\b(` +
+		`read_[a-z0-9_]*|` +
+		`[a-z0-9_]*_scan|` +
+		`[a-z0-9_]*_metadata|` +
+		`parquet_[a-z0-9_]*|` +
+		`duckdb_[a-z0-9_]*|` +
+		`pragma_[a-z0-9_]*|` +
+		`quack_[a-z0-9_]*|` +
+		`sqlite_[a-z0-9_]*|postgres_[a-z0-9_]*|mysql_[a-z0-9_]*|` +
+		`iceberg_[a-z0-9_]*|delta_[a-z0-9_]*|excel_[a-z0-9_]*|azure_[a-z0-9_]*|aws_[a-z0-9_]*|secret_[a-z0-9_]*|` +
+		`__aws__[a-z0-9_]*|` +
+		`http_[a-z0-9_]*|` +
+		`json_execute_serialized_sql|json_deserialize_sql|` +
+		`load_aws_credentials|add_parquet_key|which_secret|sniff_csv|metadata_info|` +
+		`current_setting|getvariable|getenv|stats|whoami|` +
+		`enable_logging|disable_logging|truncate_duckdb_logs|parse_duckdb_log_message|write_log|` +
+		`st_read|glob|glob_each|list_glob|` +
+		`query_table|query_table_function|query` +
+		`)\s*\(`
 
-	ddlPattern = `(?i)(^|;)\s*(create|insert|update|delete|drop|alter|attach|detach|copy|checkpoint|force_checkpoint|pragma|install|load|set|call|vacuum|summarize)\b`
+	ddlPattern = `(?i)(^|;)\s*(create|insert|update|delete|drop|alter|attach|detach|copy|checkpoint|force_checkpoint|pragma|install|load|set|call|vacuum|summarize|prepare|execute|use|connect|reset|explain|export|import)\b`
 
 	// pathStringPattern blocks DuckDB's `FROM '<path>'` / `JOIN '<path>'` /
 	// `, '<path>'` string-source shorthand, which reads files/S3/HTTP without
@@ -48,6 +78,23 @@ const (
 	// (s3://, https://, /abs, *.parquet, …) so that legitimate WHERE-clause
 	// string filters such as WHERE url = 'https://…' are not affected.
 	pathStringPattern = `(?i)\bfrom\s+\x27[^\x27]*\x27|\bjoin\s+\x27[^\x27]*\x27|,\s*\x27(?:/[^\x27]*|[^\x27]*://[^\x27]*|[^\x27]*\.(?:parquet|csv|json|avro|arrow|feather|ndjson|tsv|orc|txt|sqlite|vortex)[^\x27]*)\x27`
+
+	// quackJWTSelectOnlyMacro parses req_query with DuckDB's own parser.
+	// json_serialize_sql refuses anything whose top-level statement is not a
+	// SELECT (SET, USE, CONNECT, PREPARE, EXPLAIN, COPY, DDL, …), and the
+	// second clause rejects a SELECT that smuggles a data-modifying CTE
+	// (`WITH x AS (INSERT … RETURNING …) SELECT …`, new in DuckDB 2.0) or a
+	// SHOW/DESCRIBE (which expose settings and metadata through a SHOW_REF).
+	// A regex over the raw text cannot do either: a leading comment defeats
+	// statement-prefix matching, and DML inside a CTE is not at the start.
+	quackJWTSelectOnlyMacro = `
+		CREATE OR REPLACE MACRO quack_jwt_select_only(req_query) AS (
+			(
+				SELECT json_extract_string(ast, '$.error') = 'false'
+				   AND NOT regexp_matches(ast, '(?i)"(INSERT|UPDATE|DELETE|COPY|CREATE|ALTER|DROP)_QUERY_NODE"|"type":"SHOW_REF"')
+				FROM (SELECT CAST(json_serialize_sql(req_query) AS VARCHAR) AS ast) t
+			)
+		);`
 )
 
 // The statements Quack's client sends outside the user's SQL, which bypass
@@ -135,6 +182,8 @@ func generateSecret() string {
 // Start sets up the tables, macros, hidden control plane, and the Quack server.
 func (s *Server) Start() error {
 	s.serverSecret = generateSecret()
+	sum := sha256.Sum256([]byte(s.serverSecret))
+	s.serverSecretHash = hex.EncodeToString(sum[:])
 
 	// Install & load necessary extensions
 	setupQueries := []string{
@@ -193,18 +242,25 @@ func (s *Server) Start() error {
 
 	// Authentication macro: bridges DuckDB's auth hook to the Go control plane.
 	// req_server_token is the secret passed to quack_serve; the macro forwards
-	// it (url-encoded) so handleAuth can verify the call originated from Quack,
-	// not from a client invoking the macro directly via SQL. The macro body is
-	// readable by clients via duckdb_functions(), so it must not embed secrets;
-	// the only secret travels through req_server_token, which clients cannot
-	// supply.
+	// its SHA-256 (url-encoded) so handleAuth can verify the call originated
+	// from Quack, not from a client invoking the macro directly via SQL.
+	//
+	// Only the digest travels in the URL. read_json_auto surfaces HTTP errors,
+	// and Quack forwards a failing callback error to the client verbatim — URL
+	// included — so a raw token here would leak into client errors and server
+	// logs whenever the control plane times out or dies. The digest is not
+	// replayable: the macro hashes whatever req_server_token it is given, and a
+	// client cannot supply the raw secret.
 	authMacro := fmt.Sprintf(`
 		CREATE OR REPLACE MACRO quack_jwt_auth(req_sid, req_client_token, req_server_token) AS (
-			SELECT allowed FROM read_json_auto('http://127.0.0.1:%d/auth?sid=' || url_encode(req_sid) || '&token=' || url_encode(req_client_token) || '&srv=' || url_encode(req_server_token))
+			SELECT allowed FROM read_json_auto('http://127.0.0.1:%d/auth?sid=' || url_encode(req_sid) || '&token=' || url_encode(req_client_token) || '&srv=' || url_encode(sha256(req_server_token)))
 		);
 	`, port)
 	if _, err := s.db.Exec(authMacro); err != nil {
 		return fmt.Errorf("failed to create auth macro: %w", err)
+	}
+	if _, err := s.db.Exec(quackJWTSelectOnlyMacro); err != nil {
+		return fmt.Errorf("failed to create select-only macro: %w", err)
 	}
 
 	// Authorization macro. The previous design authorized any query whose text
@@ -212,10 +268,10 @@ func (s *Server) Start() error {
 	// table by referencing the granted name in a comment, CTE, or alias
 	// (e.g. `WITH public_metrics AS (SELECT * FROM secret) SELECT * FROM public_metrics`).
 	//
-	// The new logic is default-deny: a query is authorized only if it references
-	// at least one granted table, references NO non-granted table (reading a
-	// table always requires naming it), and invokes no file/system function that
-	// could bypass table-level grants (e.g. read_csv_auto, duckdb_settings).
+	// The logic is default-deny: the statement must parse as a SELECT (and carry
+	// no data-modifying CTE), reference at least one granted table, reference NO
+	// non-granted table (reading a table always requires naming it), and invoke
+	// no file/system/server function that could bypass table-level grants.
 	// Quack's own ATTACH-time catalog queries and transaction control
 	// statements are matched exactly and allowed; everything else referencing
 	// data is gated by the grants below.
@@ -223,7 +279,8 @@ func (s *Server) Start() error {
 		CREATE OR REPLACE MACRO quack_jwt_authz(req_sid, req_query) AS (
 			trim(regexp_replace(req_query, '\s+', ' ', 'g')) IN (%s) OR
 			(
-				EXISTS (
+				quack_jwt_select_only(req_query)
+				AND EXISTS (
 					SELECT 1
 					FROM quack_sessions s
 					JOIN quack_permissions p ON p.sub = s.sub
@@ -359,15 +416,16 @@ func (s *Server) SyncPermissions(grants map[string][]string) error {
 }
 
 // handleAuth validates the JWT via Go, recording the sid->sub session in DuckDB.
-// It first verifies req_server_token (srv) against the server secret so that
-// only Quack — not a client invoking the macro directly, nor a stray local
-// process — can establish a session.
+// It first verifies the srv digest against the SHA-256 of the server secret so
+// that only Quack — not a client invoking the macro directly, nor a stray local
+// process — can establish a session. The URL carries the digest, never the
+// secret itself.
 //
 // Every denial answers HTTP 200 with {"allowed": false}. DuckDB 2.0 raises on
 // a non-2xx response from read_json_auto and Quack forwards the callback error
 // to the client verbatim, URL included — which would leak the control-plane
-// port and the srv token in it. An in-body false keeps the client message a
-// plain "Authentication failed".
+// port (and, before the digest change, the server token). An in-body false
+// keeps the client message a plain "Authentication failed".
 func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -382,7 +440,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	case len(sid) > 256, len(token) > 1<<15, len(srv) > 256:
 		_ = json.NewEncoder(w).Encode(map[string]bool{"allowed": false})
 		return
-	case subtle.ConstantTimeCompare([]byte(srv), []byte(s.serverSecret)) != 1:
+	case subtle.ConstantTimeCompare([]byte(srv), []byte(s.serverSecretHash)) != 1:
 		_ = json.NewEncoder(w).Encode(map[string]bool{"allowed": false})
 		return
 	}

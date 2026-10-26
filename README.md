@@ -67,10 +67,22 @@ All environment variables follow the same naming and `_FILE` convention as [csi-
 | `S3_ENDPOINT` | — | — | Custom S3-compatible endpoint (MinIO, R2, …) |
 | `S3_USE_SSL` | — | `true` | Use HTTPS for S3 endpoint |
 | `QUACK_TARGET_BATCH_BYTES` | — | `0` | Target size in bytes of one FETCH wire payload; `0` keeps quack's own default of 32 MiB. See below |
+| `QUACK_SERVER_MAX_CONNECTIONS` | — | `0` | Maximum concurrent Quack clients; `0` keeps quack's default of 1024 |
+| `QUACK_SERVER_STREAM_BUFFER_BYTES` | — | `0` | Per-stream server buffer budget in bytes; `0` keeps quack's default of 256 MiB (capped at a quarter of `memory_limit`) |
 | `S3_VIEWS` | — | — | Comma-separated `name=path` pairs; views are auto-created with the reader matched to the file extension (`.parquet` → `read_parquet`, `.vortex`/`.vx` → `read_vortex`, `.csv` → `read_csv_auto`, etc.) |
 | `VIEW_SCHEMA_PATH` | — | — | YAML file declaring the columns of named views, pinning their schema without reading the whole glob, plus the partition columns to rebuild from each object's path — see below |
 
 Exactly one JWT key source must be set (`JWT_PUBLIC_KEY`, `JWT_JWKS_URL`, or `JWT_JWKS`).
+
+### Upgrading from DuckDB 1.5
+
+This tree now builds against `duckdb-go/v2 v2.20000.0` (DuckDB 2.0.0) and quack protocol 3:
+
+- Clients must run DuckDB 2.0+; a 1.5 client cannot attach.
+- New database files are written in a format DuckDB <2.0 cannot read. Existing files stay readable by both, but back up `DUCKDB_PATH` before the first 2.0 start in case you need to roll back.
+- `QUACK_FETCH_BATCH_CHUNKS` is gone; use `QUACK_TARGET_BATCH_BYTES`.
+- The credential chain moved to the `aws` extension. For IRSA set `S3_CREDENTIAL_CHAIN=web_identity`, for EKS Pod Identity or ECS `container`, for an EC2 instance profile `instance`. `sts` now requires an `ASSUME_ROLE_ARN` this config does not expose.
+- Bootstrapped views are created as `CREATE SECURE VIEW`. Existing views in a persistent database are not replaced (`IF NOT EXISTS`); a warning is logged — drop and recreate them to hide their plans and statistics.
 
 ### Permissions file format
 
@@ -193,23 +205,18 @@ export S3_REGION=us-east-1
 export S3_VIEWS='sales=s3://acme-sales/**/*.parquet,ops_logs=s3://acme-ops-logs/*.parquet,events=s3://acme-events/**/*.vortex'
 ```
 
-The server creates `CREATE SECRET IF NOT EXISTS quackjwt_s3` (using the ambient AWS credential chain) and a `CREATE VIEW IF NOT EXISTS` for each entry, using `read_parquet` for `.parquet` files and `read_vortex` for `.vortex`/`.vx` files. Required DuckDB extensions (including `vortex`, and `aws` for the credential chain in DuckDB 2.0) are installed and loaded automatically. Views are idempotent across restarts.
+The server creates `CREATE SECRET IF NOT EXISTS quackjwt_s3` (using the ambient AWS credential chain) and a `CREATE SECURE VIEW IF NOT EXISTS` for each entry, using `read_parquet` for `.parquet` files and `read_vortex` for `.vortex`/`.vx` files. Required DuckDB extensions (including `vortex`, and `aws` for the credential chain in DuckDB 2.0) are installed and loaded automatically. Views are idempotent across restarts.
+
+`SECURE VIEW` keeps the view's definition out of query plans and returns NULL for planner statistics, so a granted user cannot use `EXPLAIN` or `stats()` to reconstruct filters, partition values, or the bucket layout behind a view. The authz hook already rejects `EXPLAIN` outright; the secure flag is defense in depth (and matters for databases that predate it). Views created before this flag are not replaced — the server logs a warning and the operator must drop and recreate them.
 
 Views are bootstrapped **after** the Quack listener is up, not before it. Creating them talks to S3, and how long that takes scales with the archive; held in front of the listener it delays the port opening and a liveness probe kills the container before the first log line is written. The cost is a window after startup where a query naming a view fails to bind — visible in the logs, unlike a silent restart loop.
 
 Views are created with `hive_partitioning = true` (except `read_vortex`, which does not take it). `union_by_name` is deliberately **not** set: it would let one view span an archive written by several versions of a producer, but it makes `CREATE VIEW` eager — DuckDB reads every footer in the glob to compute the union, i.e. one S3 request per object at startup. So a view binds from whichever file the glob opens first, and a column the producer added partway through the archive's life is not selectable through it.
 
-Two ways to read across that boundary:
+Two ways to read across that boundary, both **operator-side** — clients cannot call `read_parquet` themselves, which is the point of the authorization hook:
 
-- **Per query** — pass `union_by_name` inline, and the cost is paid by the query that wants it rather than by every startup:
-  ```sql
-  SELECT * FROM remote.query($$
-    SELECT flight_id, in_tfr FROM read_parquet('s3://bucket/flights/**/*.parquet',
-             hive_partitioning = true, union_by_name = true)
-    WHERE year = '2026' AND month = '09'
-  $$);
-  ```
-- **Per view** — declare the columns in `VIEW_SCHEMA_PATH` (below), which pins them without reading the glob.
+- **Declared schema** — list the columns in `VIEW_SCHEMA_PATH` (below), which pins them without reading the glob.
+- **A second, eager view** — create one explicitly with `union_by_name = true` (in a pre-seeded database, or after startup). It pays the footer walk once at creation, so keep it separate from the views that must start fast.
 
 ### `QUACK_TARGET_BATCH_BYTES`
 
@@ -335,7 +342,7 @@ user_permissions:
     - sales_redacted
 ```
 
-Clients never see bucket paths, never hold S3 credentials, and cannot call `read_parquet` directly.
+Clients never see bucket credentials and cannot call `read_parquet` directly. They do not see view definitions or plans either; note that a server-side S3 error still names the object it failed on, so a granted view's prefix can surface in an error message.
 
 ```
 ┌──────────┐  JWT (sub=user)   ┌───────────────┐  read_parquet(s3://)  ┌──────────┐
@@ -400,11 +407,23 @@ For a lighter starting point that skips JWKS/YAML and uses a hard-coded (fake) v
 The Quack protocol speaks plain HTTP. Always front the oauth-server with a TLS-terminating reverse proxy (Caddy, Nginx, ALB). Clients should connect without `DISABLE_SSL`.
 
 ### Authorization model
-The authz macro enforces a **default-deny** policy: a query is authorized only if it references at least one granted table, references no non-granted table, invokes no file/system function (`read_parquet`, `duckdb_settings`, …), and uses no `FROM '<path>'` / `JOIN '<path>'` string-source shorthand. The classic bypasses — commenting a granted name, naming a CTE/alias after a granted table, smuggling `read_csv_auto` — are all blocked because the prohibited token still appears in the query text.
+The authz macro enforces a **default-deny** policy with two layers:
 
-The only ungated statements are the ones Quack's client sends on its own: the two ATTACH-time catalog queries, and `BEGIN TRANSACTION` / `COMMIT` / `ROLLBACK`. They are matched as exact statements after whitespace normalization, never by function name — allowing `duckdb_views()` by pattern would also allow `SELECT sql FROM duckdb_views()`, which exposes view definitions and the bucket paths in them.
+1. **The query must parse as a SELECT.** DuckDB's own parser serializes it (`json_serialize_sql`) and the hook rejects anything else — `SET`, `RESET`, `USE`, `CONNECT`, `PREPARE`/`EXECUTE`, `EXPLAIN`, `COPY`, `ATTACH`, DDL — including statements hidden behind a leading comment. A SELECT that smuggles a data-modifying CTE (`WITH x AS (INSERT … RETURNING …) SELECT …`, new in 2.0) is rejected too. This closes the statement-prefix hole that whole classes of bypass relied on; a prefix regex alone is defeated by `/* granted_table */ SET GLOBAL …`.
+2. **The SELECT must reference at least one granted table, no non-granted table, no file/system/server function, and no `FROM '<path>'` / `JOIN '<path>'` string-source shorthand.** The function denylist is deliberately broad: `read_*` (all readers and aliases), `*_scan` (`parquet_scan`, `sqlite_scan`, `iceberg_scan`, …), `duckdb_*` (metadata, logs, secrets), `pragma_*`, `quack_*` (server management), `query`/`query_table` (dynamic SQL), `load_aws_credentials`, `json_execute_serialized_sql`, `st_read`, `glob`, `current_setting`, and similar. A false positive is a denial, not an escalation.
 
-Regex-based authorization can never be as rigorous as a real SQL parser; treat it as an analytical boundary and always combine it with defense-in-depth measures.
+Quack's own ATTACH-time catalog queries and the transaction statements that wrap a remote scan are the only ungated statements; they are matched exactly after whitespace normalization. `remote.query('…')` still works because the server receives the inner SELECT, not the `query(` call.
+
+Regex-based table-name matching can never be as rigorous as a real SQL parser; treat it as an analytical boundary and always combine it with defense-in-depth measures. Two residual limitations are worth knowing:
+
+- Grants are unqualified table names. A grant for `sales` matches a table or view named `sales` in any attached catalog/schema. Do not attach a second catalog that contains a same-named, more sensitive object.
+- Server-side macros and views are trusted. A granted view may read anything its definition reads; the hook checks the client's SQL, not the view body. Keep custom views and macros under the same review as the grants.
+
+### Server management and logs
+`quack_active_connections()`, `quack_serve`/`quack_stop`, `quack_generate_keys`, `duckdb_logs()`, and the rest of the `quack_*`/`duckdb_*` families are denied to clients. That matters in 2.0: `quack_active_connections()` lists other sessions' connection ids and last queries, and `quack_stop`/`quack_serve` would let a granted user stop the listener or start another one.
+
+### Authentication caveat
+The control plane is a random loopback port. The URL carries the JWT and a SHA-256 digest of the server secret — never the secret itself, so a callback error that Quack forwards cannot reveal it. Routine denials return HTTP 200 with `allowed: false`, which keeps the client error a plain `Authentication failed`; an unexpected callback failure (control-plane timeout) can still expose the connecting client's own JWT in its error and in quack logs. Do not enable quack logging in a deployment where JWTs must not reach log storage.
 
 ### Internal tables
 The `quack_sessions` and `quack_permissions` tables (the trust backbone) are never grantable. A client cannot read, write, or exfiltrate them.
@@ -414,6 +433,7 @@ The `quack_sessions` and `quack_permissions` tables (the trust backbone) are nev
 
 ### Defense-in-depth
 
+- Authenticated users can run expensive queries. Bound memory with `QUACK_SERVER_MAX_CONNECTIONS`, `QUACK_SERVER_STREAM_BUFFER_BYTES`, and `QUACK_TARGET_BATCH_BYTES`, and give the container a `memory_limit` that matches.
 - IAM role scoped to only the buckets this server exposes.
 - Short-lived S3 credentials (instance profile / IRSA / STS), not static access keys.
 - JWT verified against IdP JWKS, `exp` enforced, short token lifetimes + refresh.

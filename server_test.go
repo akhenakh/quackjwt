@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -76,6 +78,32 @@ func TestQuackJWT_EndToEnd(t *testing.T) {
 	if err := srv.GrantAccess("user_alice", "public_metrics"); err != nil {
 		t.Fatalf("Failed to grant access: %v", err)
 	}
+
+	// The control plane only accepts the SHA-256 digest of the server secret:
+	// the raw secret must never travel in the URL, and a denial is HTTP 200
+	// with allowed=false so DuckDB does not echo the URL back to the client.
+	t.Run("Control plane accepts only the secret digest", func(t *testing.T) {
+		auth := func(sid, token, srvToken string) *httptest.ResponseRecorder {
+			req := httptest.NewRequest(http.MethodGet,
+				"/auth?sid="+sid+"&token="+token+"&srv="+srvToken, nil)
+			rec := httptest.NewRecorder()
+			srv.handleAuth(rec, req)
+			return rec
+		}
+
+		if rec := auth("raw-secret-sid", "alice-token", srv.serverSecret); rec.Code != http.StatusOK ||
+			!contains(rec.Body.String(), `"allowed":false`) {
+			t.Errorf("raw server secret accepted: code=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if rec := auth("bad-token-sid", "bad-token", srv.serverSecretHash); rec.Code != http.StatusOK ||
+			!contains(rec.Body.String(), `"allowed":false`) {
+			t.Errorf("bad token was not a clean 200 denial: code=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if rec := auth("digest-sid", "alice-token", srv.serverSecretHash); rec.Code != http.StatusOK ||
+			!contains(rec.Body.String(), `"allowed":true`) {
+			t.Errorf("digest rejected: code=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
 
 	// Parquet-backed views (the primary use case: expose views over external
 	// files). Created before the client attaches so the client sees them in the
@@ -153,6 +181,37 @@ func TestQuackJWT_EndToEnd(t *testing.T) {
 		}
 	})
 
+	// Remote query macro still works: the server sees the inner SQL, not the
+	// `query(` call itself, so the dangerous-function denylist does not break
+	// the documented remote.query() path.
+	t.Run("Remote query macro", func(t *testing.T) {
+		var val string
+		err := dbClient.QueryRow(
+			`SELECT * FROM remote_good.query('SELECT val FROM public_metrics WHERE id = 1')`,
+		).Scan(&val)
+		if err != nil {
+			t.Fatalf("remote query: %v", err)
+		}
+		if val != "public_data" {
+			t.Errorf("Expected 'public_data', got %q", val)
+		}
+	})
+
+	// EXPLAIN is a non-SELECT statement: the parser gate denies it, closing the
+	// plan/statistics leak that a regular view (or a pre-secure-view database)
+	// would otherwise expose through the remote query macro.
+	t.Run("Remote EXPLAIN denied", func(t *testing.T) {
+		_, err := dbClient.Query(
+			`SELECT * FROM remote_good.query('EXPLAIN SELECT * FROM public_metrics')`,
+		)
+		if err == nil {
+			t.Fatal("expected remote EXPLAIN to be denied")
+		}
+		if !contains(err.Error(), "Authorization failed") {
+			t.Errorf("expected 'Authorization failed', got: %v", err)
+		}
+	})
+
 	// Unauthorized Query ---
 	t.Run("Unauthorized Query", func(t *testing.T) {
 		// Alice should NOT be able to read secret_financials
@@ -214,6 +273,80 @@ func TestQuackJWT_EndToEnd(t *testing.T) {
 		} {
 			if authzAllows(q) {
 				t.Errorf("query extending an ungated statement must be denied: %q", q)
+			}
+		}
+	})
+
+	// Only SELECT statements reach the grant checks. Without the parser gate a
+	// leading comment defeated the statement-prefix regex, so a granted user
+	// could run SET GLOBAL, USE, CONNECT or PREPARE/EXECUTE — including
+	// switching the authorization function off for every session.
+	t.Run("Non-SELECT statements denied", func(t *testing.T) {
+		for _, q := range []string{
+			`/* public_metrics */ SET GLOBAL quack_authorization_function = 'quack_nop_authorization'`,
+			`/* public_metrics */ RESET GLOBAL quack_authorization_function`,
+			`PREPARE p AS SELECT * FROM public_metrics`,
+			`EXECUTE p`,
+			`/* public_metrics */ USE system`,
+			`CONNECT system /* public_metrics */`,
+			`/* public_metrics */ CREATE TABLE evil AS SELECT 1`,
+			`EXPLAIN SELECT * FROM public_metrics`,
+			`SELECT 1; SET threads=1`,
+			`CALL quack_stop('quack:127.0.0.1:1')`,
+			`DESCRIBE public_metrics`,
+			`SHOW ALL /* public_metrics */`,
+		} {
+			if authzAllows(q) {
+				t.Errorf("non-SELECT statement must be denied: %q", q)
+			}
+		}
+	})
+
+	// DuckDB 2.0 data-modifying CTEs keep the top-level statement a SELECT, so
+	// they need the second half of the parser gate. COPY is one of the pipeline
+	// steps, and is the file-write case.
+	t.Run("Data-modifying CTEs denied", func(t *testing.T) {
+		for _, q := range []string{
+			`WITH a AS (INSERT INTO public_metrics VALUES (2, 'x') RETURNING *) SELECT * FROM a`,
+			`WITH a AS (UPDATE public_metrics SET val = 'x' RETURNING *) SELECT * FROM a`,
+			`WITH a AS (DELETE FROM public_metrics RETURNING *) SELECT * FROM a`,
+			`WITH a AS (COPY (SELECT * FROM public_metrics) TO '/tmp/leak.csv') SELECT * FROM a`,
+		} {
+			if authzAllows(q) {
+				t.Errorf("data-modifying CTE must be denied: %q", q)
+			}
+		}
+	})
+
+	// Functions that read files/object storage, reach credentials or logs, or
+	// manage the quack server itself must be denied even alongside a granted
+	// table. Aliases and extension functions are covered by the generic
+	// read_* / *_scan patterns.
+	t.Run("Dangerous functions denied", func(t *testing.T) {
+		for _, q := range []string{
+			`SELECT * FROM public_metrics, query('SELECT * FROM ' || chr(115) || 'ecret_financials')`,
+			`SELECT * FROM public_metrics, query_table('secret_financials')`,
+			`SELECT * FROM public_metrics, parquet_scan('/etc/passwd')`,
+			`SELECT * FROM public_metrics, read_single_parquet_file('/etc/passwd')`,
+			`SELECT * FROM public_metrics, sqlite_scan('/tmp/x.db', 't')`,
+			`SELECT * FROM public_metrics, iceberg_scan('s3://x/y')`,
+			`SELECT * FROM public_metrics, delta_scan('s3://x/y')`,
+			`SELECT * FROM public_metrics, sniff_csv('/etc/passwd')`,
+			`SELECT * FROM public_metrics, parquet_metadata('/etc/passwd')`,
+			`SELECT * FROM public_metrics, duckdb_logs()`,
+			`SELECT * FROM public_metrics, duckdb_tables()`,
+			`SELECT * FROM public_metrics, load_aws_credentials()`,
+			`SELECT * FROM public_metrics, json_execute_serialized_sql('{}')`,
+			`SELECT * FROM public_metrics, quack_active_connections()`,
+			`SELECT * FROM public_metrics, quack_generate_keys(directory = '/tmp/x')`,
+			`SELECT * FROM public_metrics, quack_stop('quack:127.0.0.1:1')`,
+			`SELECT * FROM public_metrics, quack_serve('quack:127.0.0.1:1', token => 'x')`,
+			`SELECT * FROM public_metrics, st_read('/etc/passwd')`,
+			`SELECT * FROM public_metrics, glob('/etc/*')`,
+			`SELECT current_setting('s3_region')`,
+		} {
+			if authzAllows(q) {
+				t.Errorf("dangerous function must be denied: %q", q)
 			}
 		}
 	})
